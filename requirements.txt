@@ -1,0 +1,15 @@
+# Deep learning framework and its vision library (EfficientNet backbone, datasets, transforms).
+torch>=2.0
+torchvision>=0.15
+
+# Numerical array operations and image handling.
+numpy>=1.23
+Pillow>=9.0
+
+# Evaluation metrics (precision/recall/F1/ROC-AUC) and tabular helpers for reports.
+scikit-learn>=1.2
+pandas>=1.5
+
+# Training progress bars and plotting of robustness results.
+tqdm>=4.64
+matplotlib>=3.6
