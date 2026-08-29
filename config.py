@@ -19,8 +19,17 @@ RAW_ROOT = PROJECT_ROOT / "raw"
 MODELS_DIR = PROJECT_ROOT / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-# Filename for the best checkpoint (chosen by the monitored validation metric).
-BEST_WEIGHTS = MODELS_DIR / "best_model.pth"
+
+def weights_path(model_name):
+    """Per-model-variant checkpoint path, e.g. models/best_model_efficientnet_b1.pth.
+
+    Use this (not a single hardcoded filename) whenever more than one model
+    variant might get trained -- otherwise training efficientnet_b0 and then
+    efficientnet_b1 would silently overwrite the same best_model.pth, and
+    you'd lose the ability to compare variants afterwards.
+    """
+    safe = model_name.replace("/", "_")
+    return MODELS_DIR / f"best_model_{safe}.pth"
 
 # Train / val / test split proportions used by preprocess.py.
 SPLIT_RATIOS = (0.7, 0.15, 0.15)
@@ -163,3 +172,10 @@ TRAIN_CFG = TrainConfig()
 EVAL_CFG = EvalConfig()
 ROBUSTNESS_CFG = RobustnessConfig()
 TRAIN_AUG_CFG = TrainAugConfig()
+
+# Default checkpoint path for the currently configured model variant (used as
+# the default --weights in evaluate.py/inference.py). If you train a
+# different variant via `train.py --model efficientnet_b1`, that run computes
+# its own path via weights_path() rather than using this constant, so it
+# won't overwrite a different variant's checkpoint.
+BEST_WEIGHTS = weights_path(MODEL_CFG.name)

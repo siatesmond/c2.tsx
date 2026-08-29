@@ -17,7 +17,7 @@ from tqdm import tqdm  # progress bar helper
 
 # Project-local modules
 from config import (BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, TRAIN_CFG,
-                    MODEL_CFG, TrainConfig)
+                    MODEL_CFG, TrainConfig, weights_path)
 from datasets import RealAIDataset  # custom dataset that loads real vs AI images
 from metrics import classification_metrics  # computes F1/accuracy/precision/recall
 from model import build_model  # factory that constructs the detector network
@@ -150,7 +150,12 @@ def validation_confidence(model, loader, device, threshold):
 def main(cfg=TRAIN_CFG):
     # --- Setup ---------------------------------------------------------------
     device = resolve_device(cfg.device)
+    # Checkpoint path is derived from the model variant (e.g. efficientnet_b0
+    # vs efficientnet_b1) so training different variants never overwrites
+    # each other's saved weights.
+    weights_out = weights_path(MODEL_CFG.name)
     print(f"Device: {device} | model: {MODEL_CFG.name} | augment_level: {cfg.augment_level}")
+    print(f"Checkpoint will be saved to: {weights_out}")
     # Fix all seeds so runs are reproducible.
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -220,7 +225,7 @@ def main(cfg=TRAIN_CFG):
                 "config": cfg.__dict__,
                 "epoch": epoch,
                 "metrics": val_metrics,
-            }, BEST_WEIGHTS)
+            }, weights_out)
             print(f"  -> saved best weights (monitor={cfg.monitor}: {best_metric:.4f})")
         else:
             epochs_no_improve += 1
@@ -231,7 +236,7 @@ def main(cfg=TRAIN_CFG):
 
     # --- Teardown -----------------------------------------------------------
     # Write the full training history to a JSON file next to the weights.
-    with open(BEST_WEIGHTS.with_suffix(".history.json"), "w") as f:
+    with open(weights_out.with_suffix(".history.json"), "w") as f:
         json.dump(history, f, indent=2)
     print(f"Training complete. Best {cfg.monitor}: {best_metric:.4f}")
 
@@ -249,12 +254,19 @@ def parse_args():
     ap.add_argument("--device", type=str, default=TRAIN_CFG.device)
     ap.add_argument("--num_workers", type=int, default=TRAIN_CFG.num_workers)
     ap.add_argument("--seed", type=int, default=TRAIN_CFG.seed)
+    ap.add_argument("--model", type=str, default=MODEL_CFG.name,
+                    help="TorchVision EfficientNet variant, e.g. efficientnet_b0/b1/b2. "
+                         "Each variant is saved to its own checkpoint file.")
     return ap.parse_args()
 
 
 if __name__ == "__main__":
     # Entry point: parse CLI args, build the config object, and start training.
     a = parse_args()
+    # MODEL_CFG is a shared singleton object imported by model.py's build_model()
+    # default argument, so mutating it here propagates without needing to pass
+    # it explicitly everywhere.
+    MODEL_CFG.name = a.model
     cfg = TrainConfig(
         num_epochs=a.epochs, batch_size=a.batch_size, learning_rate=a.lr,
         augment_level=a.augment_level, scheduler=a.scheduler, monitor=a.monitor,
