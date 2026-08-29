@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Image Detector</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <h1>AI Image Detector</h1>
+    <p>Upload images to find out if they are AI-generated or real photographs</p>
+  </header>
+
+  <!-- Tab bar -->
+  <nav class="tab-bar" role="tablist" aria-label="Main navigation">
+    <button class="tab-btn active" role="tab" aria-selected="true"
+            aria-controls="tab-analyze" id="btn-analyze">
+      🖼️ Analyze Images
+    </button>
+    <button class="tab-btn" role="tab" aria-selected="false"
+            aria-controls="tab-report" id="btn-report">
+      📊 Evaluate Report
+    </button>
+  </nav>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       TAB 1 – Analyze Images
+  ══════════════════════════════════════════════════════════════════════ -->
+  <div id="tab-analyze" role="tabpanel" aria-labelledby="btn-analyze">
+
+    <!-- Upload card -->
+    <div class="card">
+      <input type="file" id="file-input"   accept=".jpg,.jpeg,.png,.bmp,.webp" multiple />
+      <input type="file" id="folder-input" accept=".jpg,.jpeg,.png,.bmp,.webp" multiple webkitdirectory />
+
+      <div id="drop-zone" role="region" aria-label="Upload area">
+        <span class="drop-icon">🖼️</span>
+        <p class="drop-hint"><strong>Drag &amp; drop</strong> images or a folder here, or use the buttons below</p>
+        <div class="pick-row">
+          <button class="pick-btn" id="pick-files-btn" type="button">
+            <span class="btn-icon">📂</span> Browse Files
+          </button>
+          <button class="pick-btn" id="pick-folder-btn" type="button">
+            <span class="btn-icon">🗂️</span> Browse Folder
+          </button>
+        </div>
+      </div>
+
+      <div id="file-list" role="list" aria-label="Selected files"></div>
+      <button id="analyze-btn" disabled>Analyze Images</button>
+      <div id="status" role="status" aria-live="polite"></div>
+    </div>
+
+    <!-- Results -->
+    <section id="results-section" aria-label="Detection results">
+      <div class="results-header">
+        <h2>Results <span id="result-count"></span></h2>
+        <button class="pick-btn" id="download-results-btn" type="button">
+          <span class="btn-icon">⬇️</span> Download JSON
+        </button>
+      </div>
+
+      <div id="summary-strip">
+        <div class="summary-card total">
+          <div class="label">Analyzed</div>
+          <div class="value" id="s-total">0</div>
+        </div>
+        <div class="summary-card ai-ct">
+          <div class="label">AI-Generated</div>
+          <div class="value" id="s-ai">0</div>
+        </div>
+        <div class="summary-card real-ct">
+          <div class="label">Real / Human</div>
+          <div class="value" id="s-real">0</div>
+        </div>
+        <div class="summary-card thresh">
+          <div class="label">Threshold</div>
+          <div class="value" id="s-thresh">—</div>
+        </div>
+
+        <div id="metrics-strip" style="display:none;width:100%">
+          <div class="metrics-row">
+            <div class="summary-card metric">
+              <div class="label">Accuracy</div>
+              <div class="value" id="s-acc">—</div>
+            </div>
+            <div class="summary-card metric">
+              <div class="label">F1 Score</div>
+              <div class="value" id="s-f1">—</div>
+            </div>
+            <div class="summary-card metric">
+              <div class="label">ROC-AUC</div>
+              <div class="value" id="s-auc">—</div>
+            </div>
+            <div class="summary-card metric">
+              <div class="label">Precision</div>
+              <div class="value" id="s-prec">—</div>
+            </div>
+            <div class="summary-card metric">
+              <div class="label">Recall</div>
+              <div class="value" id="s-rec">—</div>
+            </div>
+            <div class="summary-card fp">
+              <div class="label">False Positives</div>
+              <div class="value" id="s-fp">—</div>
+              <div class="sub" id="s-fp-conf"></div>
+            </div>
+            <div class="summary-card fn">
+              <div class="label">False Negatives</div>
+              <div class="value" id="s-fn">—</div>
+              <div class="sub" id="s-fn-conf"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrapper">
+        <table aria-label="Image detection results">
+          <thead>
+            <tr>
+              <th scope="col">#</th>
+              <th scope="col">Image ID</th>
+              <th scope="col">Preview</th>
+              <th scope="col">Filename</th>
+              <th scope="col">Verdict</th>
+              <th scope="col" id="th-true-label" style="display:none">True Label</th>
+              <th scope="col" id="th-correct"    style="display:none">Correct?</th>
+              <th scope="col">AI Score</th>
+              <th scope="col">Real Score</th>
+              <th scope="col">Confidence</th>
+              <th scope="col">Dimensions</th>
+              <th scope="col">File Size</th>
+              <th scope="col">Inference</th>
+            </tr>
+          </thead>
+          <tbody id="results-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </div><!-- /tab-analyze -->
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       TAB 2 – Evaluate Report
+  ══════════════════════════════════════════════════════════════════════ -->
+  <div id="tab-report" role="tabpanel" aria-labelledby="btn-report" style="display:none">
+
+    <div class="report-toolbar">
+      <button class="pick-btn" id="load-report-btn" type="button">
+        <span class="btn-icon">🔄</span> Load Report
+      </button>
+      <button class="pick-btn" id="download-report-btn" type="button" style="display:none">
+        <span class="btn-icon">⬇️</span> Download JSON
+      </button>
+      <span id="report-source" class="report-source"></span>
+    </div>
+
+    <div id="report-error" class="report-error" style="display:none"></div>
+
+    <!-- Score banner -->
+    <div id="report-banner" style="display:none">
+      <div class="score-banner">
+        <div class="score-main">
+          <div class="score-label">Final Score</div>
+          <div class="score-value" id="r-final-score">—</div>
+          <div class="score-sub">0.5 × Clean AUC + 0.5 × Robust AUC</div>
+        </div>
+        <div class="score-side">
+          <div class="score-item">
+            <span class="score-item-label">Clean ROC-AUC</span>
+            <span class="score-item-val" id="r-clean-auc">—</span>
+          </div>
+          <div class="score-item">
+            <span class="score-item-label">Robustness Score</span>
+            <span class="score-item-val" id="r-rob-score">—</span>
+          </div>
+          <div class="score-item">
+            <span class="score-item-label">Threshold (Youden's J)</span>
+            <span class="score-item-val" id="r-threshold">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Clean metrics -->
+      <h3 class="report-section-title">Clean Test Metrics</h3>
+      <div class="report-cards" id="r-clean-cards"></div>
+
+      <!-- Robustness -->
+      <h3 class="report-section-title">
+        Robustness
+        <span class="section-sub">ROC-AUC across 15 transforms · 6 families</span>
+      </h3>
+
+      <div class="rob-grid">
+        <!-- By family -->
+        <div class="rob-panel">
+          <div class="rob-panel-title">By Family</div>
+          <div id="r-rob-families"></div>
+        </div>
+        <!-- Per transform -->
+        <div class="rob-panel">
+          <div class="rob-panel-title">Per Transform</div>
+          <div id="r-rob-transforms"></div>
+        </div>
+      </div>
+
+      <!-- Weakest transforms callout -->
+      <div id="r-weakest" class="weakest-box" style="display:none">
+        <span class="weakest-label">⚠ Weakest transforms</span>
+        <span id="r-weakest-list"></span>
+      </div>
+
+      <!-- Error analysis -->
+      <h3 class="report-section-title">Error Analysis</h3>
+
+      <div class="error-analysis-grid">
+        <div class="ea-card fp">
+          <div class="ea-title">False Positives <span class="ea-note">(real → AI)</span></div>
+          <div class="ea-count" id="r-fp-count">—</div>
+          <div class="ea-conf" id="r-fp-conf"></div>
+        </div>
+        <div class="ea-card fn">
+          <div class="ea-title">False Negatives <span class="ea-note">(AI → real)</span></div>
+          <div class="ea-count" id="r-fn-count">—</div>
+          <div class="ea-conf" id="r-fn-conf"></div>
+        </div>
+      </div>
+
+      <div id="r-interpretation" class="interpretation-box"></div>
+
+      <div class="examples-row">
+        <details class="example-details" id="r-fp-examples-wrap">
+          <summary>False positive examples <span id="r-fp-ex-count"></span></summary>
+          <ul class="example-list" id="r-fp-examples"></ul>
+        </details>
+        <details class="example-details" id="r-fn-examples-wrap">
+          <summary>False negative examples <span id="r-fn-ex-count"></span></summary>
+          <ul class="example-list" id="r-fn-examples"></ul>
+        </details>
+      </div>
+
+    </div><!-- /report-banner -->
+  </div><!-- /tab-report -->
+
+  <!-- JavaScript -->
+  <script>
+  // ═══════════════════════════════════════════════════════════════════════
+  // TAB
+  // ═══════════════════════════════════════════════════════════════════════
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => {
+        b.classList.remove('active');
+        b.setAttribute('aria-selected', 'false');
+      });
+      btn.classList.add('active');
+      btn.setAttribute('aria-selected', 'true');
+      const target = btn.getAttribute('aria-controls');
+      document.getElementById('tab-analyze').style.display = target === 'tab-analyze' ? '' : 'none';
+      document.getElementById('tab-report').style.display  = target === 'tab-report'  ? '' : 'none';
+    });
+  });
+
+  // ── On page load: auto-load report content the first time the tab is opened
+  let _reportLoaded = false;
+
+  // Auto-load report content the first time the user opens the tab
+  document.getElementById('btn-report').addEventListener('click', () => {
+    if (!_reportLoaded) { _reportLoaded = true; loadReport(); }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // TAB 1 — ANALYZE
+  // ═══════════════════════════════════════════════════════════════════════
+  const dropZone       = document.getElementById('drop-zone');
+  const fileInput      = document.getElementById('file-input');
+  const folderInput    = document.getElementById('folder-input');
+  const pickFilesBtn   = document.getElementById('pick-files-btn');
+  const pickFolderBtn  = document.getElementById('pick-folder-btn');
+  const fileList       = document.getElementById('file-list');
+  const analyzeBtn     = document.getElementById('analyze-btn');
+  const statusEl       = document.getElementById('status');
+  const resultsSection = document.getElementById('results-section');
+  const resultsBody    = document.getElementById('results-body');
+  const resultCount    = document.getElementById('result-count');
+
+  const selectedMap = new Map();
+
+  pickFilesBtn.addEventListener('click',  () => fileInput.click());
+  pickFolderBtn.addEventListener('click', () => folderInput.click());
+  fileInput.addEventListener('change',   () => { addFiles([...fileInput.files]);  fileInput.value  = ''; });
+  folderInput.addEventListener('change', () => { addFiles([...folderInput.files]); folderInput.value = ''; });
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', e => { if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('dragover'); });
+  dropZone.addEventListener('drop', async e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const items = [...(e.dataTransfer.items || [])];
+    if (items.length && items[0].webkitGetAsEntry) {
+      addFiles(await collectFromEntries(items.map(i => i.webkitGetAsEntry())));
+    } else {
+      addFiles([...e.dataTransfer.files]);
+    }
+  });
+
+  function collectFromEntries(entries) {
+    const EXT = /\.(jpe?g|png|bmp|webp)$/i;
+    const files = []; let pending = 0;
+    return new Promise(resolve => {
+      function walk(entry) {
+        if (!entry) return;
+        if (entry.isFile) {
+          if (!EXT.test(entry.name)) return;
+          pending++;
+          entry.file(f => { files.push(f); if (--pending === 0) resolve(files); });
+        } else if (entry.isDirectory) {
+          const reader = entry.createReader(); pending++;
+          (function readAll() {
+            reader.readEntries(batch => {
+              if (!batch.length) { if (--pending === 0) resolve(files); return; }
+              batch.forEach(walk); readAll();
+            });
+          })();
+        }
+      }
+      entries.forEach(walk);
+      if (pending === 0) resolve(files);
+    });
+  }
+
+  const ALLOWED_MIME = new Set(['image/jpeg','image/png','image/bmp','image/webp']);
+  function addFiles(newFiles) {
+    let added = 0;
+    newFiles.forEach(f => {
+      if (!ALLOWED_MIME.has(f.type) && !/\.(jpe?g|png|bmp|webp)$/i.test(f.name)) return;
+      const key = `${f.name}|${f.size}`;
+      if (!selectedMap.has(key)) { selectedMap.set(key, f); added++; }
+    });
+    if (added) renderQueue();
+  }
+  function clearAll()       { selectedMap.clear(); renderQueue(); }
+  function removeFile(key)  { selectedMap.delete(key); renderQueue(); }
+
+  function renderQueue() {
+    fileList.innerHTML = '';
+    const files = [...selectedMap.values()];
+    const n = files.length;
+    if (n === 0) { analyzeBtn.disabled = true; setStatus(''); return; }
+    analyzeBtn.disabled = false;
+    const totalKB = (files.reduce((s, f) => s + f.size, 0) / 1024).toFixed(0);
+    if (n > 8) {
+      const div = document.createElement('div');
+      div.className = 'queue-summary';
+      div.innerHTML = `<div><span class="q-label">${n} images selected</span><span class="q-meta"> · ${totalKB} KB total</span></div>
+        <button class="clear-btn" id="clear-all-btn" type="button">Clear all</button>`;
+      fileList.appendChild(div);
+      div.querySelector('#clear-all-btn').addEventListener('click', clearAll);
+    } else {
+      const wrap = document.createElement('div');
+      wrap.className = 'chip-list';
+      [...selectedMap.entries()].forEach(([key, f]) => {
+        const chip = document.createElement('div');
+        chip.className = 'file-chip';
+        chip.setAttribute('role', 'listitem');
+        chip.innerHTML = `<span>${escHtml(f.name)}</span>
+          <span class="remove-chip" role="button" tabindex="0" aria-label="Remove ${escHtml(f.name)}">×</span>`;
+        chip.querySelector('.remove-chip').addEventListener('click', () => removeFile(key));
+        chip.querySelector('.remove-chip').addEventListener('keydown', e => { if (e.key==='Enter'||e.key===' ') removeFile(key); });
+        wrap.appendChild(chip);
+      });
+      fileList.appendChild(wrap);
+    }
+  }
+
+  analyzeBtn.addEventListener('click', async () => {
+    const files = [...selectedMap.values()];
+    if (!files.length) return;
+    analyzeBtn.disabled = true;
+    setStatus(`<span class="spinner"></span>Analyzing ${files.length} image(s)…`);
+    const form = new FormData();
+    files.forEach(f => { form.append('images', f); form.append('paths[]', f.webkitRelativePath || f.name); });
+    let data;
+    try {
+      const resp = await fetch('/predict', { method: 'POST', body: form });
+      const text = await resp.text();
+      try { data = JSON.parse(text); } catch { throw new Error(`Server returned HTTP ${resp.status}. Check the terminal.`); }
+      if (!resp.ok) throw new Error(data.error || 'Server error ' + resp.status);
+    } catch (err) { setStatus('Error: ' + err.message, true); analyzeBtn.disabled = false; return; }
+    analyzeBtn.disabled = false;
+    setStatus('');
+    _lastResults = data;
+    renderResults(data);
+  });
+
+  function renderResults(data) {
+    const rows      = Array.isArray(data) ? data : (data.results || []);
+    const aggregate = Array.isArray(data) ? null  : (data.aggregate || null);
+    resultsBody.innerHTML = '';
+    resultsSection.style.display = 'block';
+    const ok        = rows.filter(r => !r.error);
+    const aiCount   = ok.filter(r => r.verdict === 'AI-Generated').length;
+    const hasLabels = aggregate !== null;
+
+    document.getElementById('s-total').textContent  = ok.length;
+    document.getElementById('s-ai').textContent     = aiCount;
+    document.getElementById('s-real').textContent   = ok.length - aiCount;
+    document.getElementById('s-thresh').textContent = aggregate ? aggregate.threshold : (ok[0]?.threshold_used ?? '—');
+    resultCount.textContent = `(${rows.length} image${rows.length !== 1 ? 's' : ''})`;
+
+    const metricsStrip = document.getElementById('metrics-strip');
+    if (hasLabels) {
+      const m = aggregate.metrics, ea = aggregate.error_analysis;
+      const pct = v => (v != null && !isNaN(v)) ? (v*100).toFixed(1)+'%' : '—';
+      document.getElementById('s-acc').textContent  = pct(m.accuracy);
+      document.getElementById('s-f1').textContent   = pct(m.f1);
+      document.getElementById('s-auc').textContent  = pct(m.roc_auc);
+      document.getElementById('s-prec').textContent = pct(m.precision);
+      document.getElementById('s-rec').textContent  = pct(m.recall);
+      document.getElementById('s-fp').textContent   = ea.false_positives;
+      document.getElementById('s-fn').textContent   = ea.false_negatives;
+      document.getElementById('s-fp-conf').textContent = ea.fp_mean_confidence != null ? `avg conf ${(ea.fp_mean_confidence*100).toFixed(1)}%` : '';
+      document.getElementById('s-fn-conf').textContent = ea.fn_mean_confidence != null ? `avg conf ${(ea.fn_mean_confidence*100).toFixed(1)}%` : '';
+      metricsStrip.style.display = '';
+      document.getElementById('th-true-label').style.display = '';
+      document.getElementById('th-correct').style.display    = '';
+    } else {
+      metricsStrip.style.display = 'none';
+      document.getElementById('th-true-label').style.display = 'none';
+      document.getElementById('th-correct').style.display    = 'none';
+    }
+
+    rows.forEach((r, i) => {
+      const tr = document.createElement('tr');
+      if (r.error) {
+        tr.className = 'error-row';
+        tr.innerHTML = `<td>${i+1}</td><td>—</td><td>—</td>
+          <td class="fname" title="${escHtml(r.filename)}">${escHtml(r.filename)}</td>
+          <td colspan="${hasLabels?9:7}">⚠ ${escHtml(r.error)}</td>`;
+      } else {
+        const isAI    = r.verdict === 'AI-Generated';
+        const aiPct   = (r.prob_ai  *100).toFixed(1);
+        const realPct = (r.prob_real*100).toFixed(1);
+        const aiColor   = isAI ? 'var(--ai)'   : 'var(--muted)';
+        const realColor = isAI ? 'var(--muted)' : 'var(--real)';
+        let tlCell = '', okCell = '';
+        if (hasLabels) {
+          const tl = r.true_label;
+          if (tl == null) {
+            tlCell = `<td><span class="badge unknown-badge">Unknown</span></td>`;
+            okCell = `<td><span class="meta-cell">—</span></td>`;
+          } else {
+            tlCell = `<td><span class="badge ${tl===1?'ai':'real'}">${tl===1?'AI':'Real'}</span></td>`;
+            if (r.correct) { okCell = `<td><span class="correct-badge correct">✓ Yes</span></td>`; tr.classList.add('row-correct'); }
+            else           { okCell = `<td><span class="correct-badge wrong">✗ No</span></td>`;   tr.classList.add('row-wrong'); }
+          }
+        }
+        tr.innerHTML = `
+          <td>${i+1}</td>
+          <td><code style="font-size:.78rem;color:var(--accent2)">${escHtml(r.id)}</code></td>
+          <td class="thumb-cell"><img src="${r.thumbnail}" alt="${escHtml(r.filename)}" loading="lazy"/></td>
+          <td class="fname" title="${escHtml(r.filename)}">${escHtml(r.filename)}</td>
+          <td><span class="badge ${isAI?'ai':'real'}">${isAI?' AI-Generated':' Real/Human'}</span></td>
+          ${tlCell}${okCell}
+          <td><div class="prob-bar-wrap"><div class="prob-bar-bg"><div class="prob-bar-fill" style="width:${aiPct}%;background:${aiColor}"></div></div><span class="prob-val">${aiPct}%</span></div></td>
+          <td><div class="prob-bar-wrap"><div class="prob-bar-bg"><div class="prob-bar-fill" style="width:${realPct}%;background:${realColor}"></div></div><span class="prob-val">${realPct}%</span></div></td>
+          <td>${confBadge(r.confidence)}</td>
+          <td class="meta-cell">${r.width} × ${r.height} px</td>
+          <td class="meta-cell">${r.file_size_kb} KB</td>
+          <td class="meta-cell">${r.inference_ms} ms</td>`;
+      }
+      resultsBody.appendChild(tr);
+    });
+    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // TAB 2 — EVALUATE REPORT
+  // ═══════════════════════════════════════════════════════════════════════
+  document.getElementById('load-report-btn').addEventListener('click', loadReport);
+
+  document.getElementById('load-report-btn').addEventListener('click', () => {
+    _reportLoaded = true;   // manual reload always allowed
+    loadReport();
+  });
+
+  async function loadReport() {
+    const errBox    = document.getElementById('report-error');
+    const banner    = document.getElementById('report-banner');
+    const sourceEl  = document.getElementById('report-source');
+    const dlBtn     = document.getElementById('download-report-btn');
+    errBox.style.display = 'none';
+    banner.style.display = 'none';
+    dlBtn.style.display  = 'none';
+    sourceEl.textContent = '';
+    document.getElementById('load-report-btn').innerHTML = '<span class="spinner"></span> Loading…';
+
+    let d;
+    try {
+      const resp = await fetch('/eval-report');
+      const text = await resp.text();
+      try { d = JSON.parse(text); } catch { throw new Error('Server returned non-JSON response.'); }
+      if (!resp.ok) throw new Error(d.error || 'HTTP ' + resp.status);
+    } catch (err) {
+      errBox.textContent = '⚠ ' + err.message;
+      errBox.style.display = '';
+      document.getElementById('load-report-btn').innerHTML = '<span class="btn-icon">🔄</span> Load Report';
+      return;
+    }
+    document.getElementById('load-report-btn').innerHTML = '<span class="btn-icon">🔄</span> Reload';
+    if (d._source) sourceEl.textContent = 'Source: ' + d._source;
+
+    // Wire download button for the eval report
+    dlBtn.style.display = '';
+    dlBtn.onclick = () => downloadJson(d, 'eval_report.json');
+
+    renderReport(d);
+    banner.style.display = '';
+  }
+
+  function renderReport(d) {
+    const pct  = v => (v != null && !isNaN(v)) ? (v*100).toFixed(2)+'%' : '—';
+    const fmt  = v => (v != null && !isNaN(v)) ? Number(v).toFixed(4) : '—';
+
+    // Score banner
+    document.getElementById('r-final-score').textContent = pct(d.final_score);
+    document.getElementById('r-clean-auc').textContent   = pct(d.clean_metrics?.roc_auc);
+    document.getElementById('r-rob-score').textContent   = pct(d.robustness?.robustness_score);
+    document.getElementById('r-threshold').textContent   = fmt(d.threshold);
+
+    // Clean metrics cards
+    const cleanCards = document.getElementById('r-clean-cards');
+    cleanCards.innerHTML = '';
+    const cm = d.clean_metrics || {};
+    const metricDefs = [
+      { key: 'accuracy',  label: 'Accuracy' },
+      { key: 'precision', label: 'Precision' },
+      { key: 'recall',    label: 'Recall' },
+      { key: 'f1',        label: 'F1 Score' },
+      { key: 'roc_auc',   label: 'ROC-AUC' },
+    ];
+    metricDefs.forEach(({ key, label }) => {
+      const card = document.createElement('div');
+      card.className = 'summary-card metric';
+      card.innerHTML = `<div class="label">${label}</div><div class="value">${pct(cm[key])}</div>`;
+      cleanCards.appendChild(card);
+    });
+
+    // Robustness by family
+    const famEl = document.getElementById('r-rob-families');
+    famEl.innerHTML = '';
+    const byFam = d.robustness_by_family || {};
+    Object.entries(byFam).sort((a,b) => a[1]-b[1]).forEach(([name, auc]) => {
+      famEl.appendChild(robBar(name, auc));
+    });
+
+    // Per-transform
+    const tfEl = document.getElementById('r-rob-transforms');
+    tfEl.innerHTML = '';
+    const perTf = d.robustness?.per_transform || {};
+    Object.entries(perTf).sort((a,b) => a[1]-b[1]).forEach(([name, auc]) => {
+      tfEl.appendChild(robBar(name, auc));
+    });
+
+    // Weakest 3
+    const sorted = Object.entries(perTf).sort((a,b) => a[1]-b[1]);
+    const weakest3 = sorted.slice(0, 3);
+    if (weakest3.length) {
+      document.getElementById('r-weakest').style.display = '';
+      document.getElementById('r-weakest-list').innerHTML =
+        weakest3.map(([n,v]) => `<span class="weakest-item">${escHtml(n)} <b>${pct(v)}</b></span>`).join('');
+    }
+
+    // Error analysis
+    const ea = d.error_analysis || {};
+    document.getElementById('r-fp-count').textContent = ea.false_positives ?? '—';
+    document.getElementById('r-fn-count').textContent = ea.false_negatives ?? '—';
+    document.getElementById('r-fp-conf').textContent =
+      ea.fp_mean_confidence != null ? `mean confidence ${pct(ea.fp_mean_confidence)}` : '';
+    document.getElementById('r-fn-conf').textContent =
+      ea.fn_mean_confidence != null ? `mean confidence ${pct(ea.fn_mean_confidence)}` : '';
+
+    const interpEl = document.getElementById('r-interpretation');
+    interpEl.textContent = ea.interpretation || '';
+    interpEl.style.display = ea.interpretation ? '' : 'none';
+
+    // FP examples
+    renderExamples('r-fp-examples', 'r-fp-ex-count', ea.fp_examples || []);
+    renderExamples('r-fn-examples', 'r-fn-ex-count', ea.fn_examples || []);
+  }
+
+  function robBar(name, auc) {
+    const pct = Math.max(0, Math.min(100, auc * 100));
+    // colour: green ≥80%, amber 60–80%, red <60%
+    const color = pct >= 80 ? 'var(--real)' : pct >= 60 ? 'var(--warn)' : 'var(--ai)';
+    const div = document.createElement('div');
+    div.className = 'rob-bar-row';
+    div.innerHTML = `
+      <span class="rob-bar-label" title="${escHtml(name)}">${escHtml(name)}</span>
+      <div class="rob-bar-track">
+        <div class="rob-bar-fill" style="width:${pct.toFixed(1)}%;background:${color}"></div>
+      </div>
+      <span class="rob-bar-val">${pct.toFixed(1)}%</span>`;
+    return div;
+  }
+
+  function renderExamples(listId, countId, paths) {
+    const el = document.getElementById(listId);
+    const ct = document.getElementById(countId);
+    el.innerHTML = '';
+    ct.textContent = paths.length ? `(${paths.length})` : '(none)';
+    paths.forEach(p => {
+      const li = document.createElement('li');
+      li.textContent = p;
+      el.appendChild(li);
+    });
+  }
+
+  // Download analyze results
+  let _lastResults = null;   // holds the most recent {results, aggregate} payload
+
+  document.getElementById('download-results-btn').addEventListener('click', () => {
+    if (!_lastResults) return;
+    const ts = new Date().toISOString().slice(0,19).replace(/[:T]/g, '-');
+    downloadJson(_lastResults, `analyze_results_${ts}.json`);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // SHARED HELPERS
+  // ═══════════════════════════════════════════════════════════════════════
+  function downloadJson(obj, filename) {
+    // Strip the thumbnail data URIs so the file stays small and readable
+    let payload = obj;
+    if (obj.results) {
+      payload = {
+        ...obj,
+        results: obj.results.map(r => {
+          if (!r.thumbnail) return r;
+          const { thumbnail, ...rest } = r;
+          return rest;
+        }),
+      };
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  function confBadge(level) {
+    const cls = {'Very High':'very-high','High':'high','Moderate':'moderate','Low':'low'}[level]||'low';
+    return `<span class="conf-badge ${cls}">${level}</span>`;
+  }
+  function setStatus(html, isError=false) { statusEl.innerHTML = html; statusEl.className = isError?'error':''; }
+  function escHtml(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  </script>
+</body>
+</html>

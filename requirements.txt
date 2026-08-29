@@ -13,3 +13,6 @@ pandas>=1.5
 # Training progress bars and plotting of robustness results.
 tqdm>=4.64
 matplotlib>=3.6
+
+# Web interface (app.py).
+flask>=3.0

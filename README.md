@@ -414,3 +414,188 @@ Small, dependency-light module used by both `train.py` and `evaluate.py`:
   the full per-transform breakdown.
 
 
+
+&nbsp;
+
+## Web Interface (`app.py`)
+
+A browser-based frontend with two tabs:
+
+- **Analyze Images** - upload images and get per-image AI detection results
+- **Evaluate Report** - view and download the full evaluation report produced by `evaluate.py`
+
+### Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+### Running
+
+```bash
+python app.py
+```
+
+Then open **http://127.0.0.1:5000** in your browser.
+
+---
+
+### Tab 1 - Analyze Images
+
+#### Input
+
+The interface accepts images three ways:
+
+- **Browse Files** - standard file picker; hold `Ctrl`/`Cmd` to select multiple images at once.
+- **Browse Folder** - folder picker that automatically includes every image inside, including nested subfolders.
+- **Drag & drop** - drag image files or an entire folder onto the drop zone. The drop handler walks the directory tree recursively via the browser's `FileSystemEntry` API.
+
+All three methods feed into the same queue. Duplicates (same filename + size) are silently ignored. With 8 or fewer files queued the individual filenames are shown as removable chips; with more than 8 a compact summary bar is shown with a "Clear all" button.
+
+Click **Analyze Images** to submit. Results appear immediately as table rows.
+
+#### Summary strip
+
+The strip above the table always shows four base cards:
+
+| Card | Description |
+|---|---|
+| Analyzed | Total images successfully processed |
+| AI-Generated | Count the model predicted as AI |
+| Real / Human | Count the model predicted as real |
+| Threshold | Probability cutoff. Auto-tuned to the ROC-optimal value (Youden's J) when labels are present; defaults to 0.5 otherwise |
+
+A second row of metric cards appears **only when ground-truth labels are detected** (images loaded from a folder named `ai/` or `real/`):
+
+| Card | Description |
+|---|---|
+| Accuracy | Percentage of all images the model got right |
+| F1 Score | Harmonic mean of precision and recall |
+| ROC-AUC | How well the model ranks AI images above real ones across all thresholds. 1.0 = perfect, 0.5 = random |
+| Precision | Of all images called AI, the fraction that actually were |
+| Recall | Of all actual AI images, the fraction the model caught |
+| False Positives | Real images misclassified as AI, with mean confidence shown |
+| False Negatives | AI images misclassified as real, with mean confidence shown |
+
+#### Per-image table
+
+| Column | Description |
+|---|---|
+| # | Row index |
+| Image ID | Short random hex ID assigned at inference time |
+| Preview | 64 × 64 thumbnail of the uploaded image |
+| Filename | Original filename |
+| Verdict | AI-Generated or Real / Human |
+| True Label | *(label mode only)* Ground truth inferred from folder name |
+| Correct? | *(label mode only)* ✓ Yes (green) or ✗ No (red). Rows are tinted accordingly |
+| AI Score | Model's AI-likelihood probability (0–100%) with a fill bar |
+| Real Score | `100% − AI Score` with a fill bar |
+| Confidence | Distance from the 50% boundary - **Very High** (≥ 90%), **High** (≥ 75%), **Moderate** (≥ 60%), **Low** |
+| Dimensions | Original image width × height in pixels |
+| File Size | Upload size in KB |
+| Inference | Time the model spent on that single image (ms) |
+
+A **Download JSON** button in the results header exports the full `{ results, aggregate }` payload as a timestamped JSON file. Thumbnails are stripped from the download to keep the file small.
+
+#### Label detection
+
+Labels are inferred from the folder name in the file's relative path (via `webkitRelativePath`):
+
+- `ai`, `ai_generated`, `fake`, `synthetic` → label 1 (AI)
+- `real`, `human`, `authentic`, `genuine` → label 0 (Real)
+- Anything else or individually picked files → no label, metrics strip hidden
+
+Dropping your existing `data/test/ai/` and `data/test/real/` folders directly onto the drop zone will automatically produce the full metrics report.
+
+---
+
+### Tab 2 - Evaluate Report
+
+```bash
+python evaluate.py
+```
+
+Refresh the page after running `evaluate.py`.
+
+The report is divided into four sections:
+
+**Score banner**
+The headline final score (`0.5 × Clean AUC + 0.5 × Robust AUC`) shown large, alongside clean ROC-AUC, robustness score, and the Youden's J optimal threshold.
+
+**Clean test metrics**
+Accuracy, precision, recall, F1, and ROC-AUC from the unmodified test set, displayed as cards.
+
+**Robustness**
+Two side-by-side panels:
+- *By family* - one bar per transform family (JPEG, blur, noise, resize, color, crop), sorted worst-first
+- *Per transform* - all 15 individual transforms sorted worst-first
+
+Bars are colour-coded: green ≥ 80%, amber 60–80%, red < 60%. The three weakest transforms are called out in a red highlight box below.
+
+**Error analysis**
+False positive and false negative counts with mean model confidence on each error type, the plain-English interpretation text from `evaluate.py`, and collapsible lists of up to 20 example filenames per error type.
+
+A **Download JSON** button downloads the raw `eval_report.json` file. A **Reload** button re-fetches the file from disk without refreshing the page (useful after re-running `evaluate.py`).
+
+---
+
+### API endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Serves the UI |
+| `POST` | `/predict` | Runs inference on uploaded images |
+| `GET` | `/eval-report` | Returns `eval_report.json` as JSON (404 if not found) |
+| `GET` | `/eval-report/exists` | Returns `{"exists": true/false}` - lightweight file presence check used on page load |
+
+`POST /predict` - request and response shapes:
+
+- **Request:** `multipart/form-data` with files under `images` and matching relative paths under `paths[]`. Accepted: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`. Max: 500 MB.
+- **Response:** `{ "results": [...], "aggregate": {...} | null }`
+
+`results` - one object per file:
+
+```json
+{
+  "id": "A3F2C1B0",
+  "filename": "photo.jpg",
+  "thumbnail": "data:image/jpeg;base64,…",
+  "prob_ai": 0.9123,
+  "prob_real": 0.0877,
+  "verdict": "AI-Generated",
+  "confidence": "Very High",
+  "pred_label": 1,
+  "true_label": 1,
+  "correct": true,
+  "width": 1024,
+  "height": 768,
+  "file_size_kb": 214.5,
+  "inference_ms": 38.2,
+  "threshold_used": 0.5
+}
+```
+
+`aggregate` - present only when at least two labelled images were submitted:
+
+```json
+{
+  "n": 40,
+  "threshold": 0.002,
+  "metrics": {
+    "accuracy": 0.8872,
+    "precision": 0.8901,
+    "recall": 0.8875,
+    "f1": 0.8887,
+    "roc_auc": 0.9564
+  },
+  "error_analysis": {
+    "false_positives": 12,
+    "false_negatives": 10,
+    "fp_mean_confidence": 0.7341,
+    "fn_mean_confidence": 0.3102
+  }
+}
+```
+
+On a per-file error the result object contains `"error": "<message>"` instead of the prediction fields.
+On a per-file error (unsupported type, corrupt image, etc.) the result object contains `"error": "<message>"` instead of the prediction fields.
