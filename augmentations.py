@@ -14,9 +14,10 @@ Design goals for the training sampler (see config.TRAIN_AUG_CFG):
      eval harness tests at (see config.EVAL_SEVERITY_POINTS) -- training on the
      exact eval grid would make the robustness score partly measure memorization
      of those specific parameters rather than genuine generalization.
-  3. Mostly apply a SINGLE family per image (level 1), with compound/stacked
-     corruptions (level 2) as a minority case -- closer to how real-world re-uploads
-     usually pick up one degradation, occasionally two.
+  3. Apply AT MOST ONE family per image -- transforms are never stacked. The
+     robustness spec evaluates each transform individually, and a typical
+     real-world re-upload applies a single degradation step, so training
+     matches that rather than mixing/matching corruptions.
   4. Keep a separate "generalization" pool (small rotation, grayscale) that
      is NOT part of the evaluated families at all. This adds useful invariances
      without ever overlapping the eval space, so it can't inflate/deflate the
@@ -187,14 +188,15 @@ def apply_family_transform(img, family, rng, cfg):
 def apply_training_augmentation(img, rng, aug_cfg=None):
     """Sample one realistic training augmentation for a single image.
 
+    At most ONE transform is ever applied -- corruptions are never stacked.
+
     - With probability `aug_cfg.generalization_prob`, draw a single transform
-      from GENERALIZATION_POOL (flip/rotate/grayscale) -- never overlaps the
+      from GENERALIZATION_POOL (rotate/grayscale) -- never overlaps the
       evaluated families.
-    - Otherwise, draw a transform COUNT k from `aug_cfg.num_transforms_weights`
-      (k=0 no-op, k=1 single corruption -- the common case, k=2 a compound/
-      stacked corruption -- a minority case), then apply that many DISTINCT
-      robustness families, each at a randomly sampled severity that avoids the
-      exact eval grid points.
+    - Otherwise, with probability `aug_cfg.apply_prob`, draw exactly one
+      robustness family (uniformly from FAMILIES) and apply it at a randomly
+      sampled severity that avoids the exact eval grid points. With the
+      remaining probability the image is left clean.
     """
     aug_cfg = aug_cfg or TRAIN_AUG_CFG
 
@@ -202,15 +204,11 @@ def apply_training_augmentation(img, rng, aug_cfg=None):
         _, fn = rng.choice(GENERALIZATION_POOL)
         return fn(img, rng)
 
-    weights = aug_cfg.num_transforms_weights
-    k = rng.choices(list(weights.keys()), weights=list(weights.values()), k=1)[0]
-    if k <= 0:
-        return img
+    if rng.random() >= aug_cfg.apply_prob:
+        return img  # leave a clean image so the undistorted signal is kept
 
-    families = rng.sample(FAMILIES, k=min(k, len(FAMILIES)))
-    for fam in families:
-        img = apply_family_transform(img, fam, rng, aug_cfg)
-    return img
+    fam = rng.choice(FAMILIES)
+    return apply_family_transform(img, fam, rng, aug_cfg)
 
 
 def get_augment_names():

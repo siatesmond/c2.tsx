@@ -5,7 +5,7 @@ filesystem locations so every module reads from one place. The robustness spec
 below documents the exact transform families/parameters used for evaluation.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 # Root of this project (the folder containing this file).
@@ -71,9 +71,10 @@ class TrainConfig:
     monitor: str = "f1"
     # Decision threshold for converting probabilities to class predictions.
     threshold: float = 0.5
-    # Master on/off switch for training-time augmentation. The actual mix of
-    # how many transforms get applied, and which ones, is controlled by
-    # TRAIN_AUG_CFG below (see TrainAugConfig.num_transforms_weights).
+    # Master on/off switch for training-time augmentation. Which family gets
+    # applied (and at what severity) is controlled by TRAIN_AUG_CFG below.
+    # Note: at most ONE transform is ever applied per image -- see
+    # TrainAugConfig.apply_prob / augmentations.apply_training_augmentation.
     augment_level: int = 1
     num_workers: int = 4
     seed: int = 42
@@ -112,21 +113,24 @@ class TrainAugConfig:
       * Keep those random severities away from the exact eval grid points
         (config.EVAL_SEVERITY_POINTS) so the robustness score measures
         generalization, not memorization of the eval parameters.
-      * Bias heavily toward a SINGLE transform per image, with compound
-        (2-transform) corruptions as a deliberate minority.
+      * Apply AT MOST ONE transform per image -- never stacked. The brief
+        evaluates robustness against each transform individually ("a subset
+        of the following augmentations"), so training mirrors that: one
+        degradation per image, matching a single real-world re-upload step.
       * Route a separate slice of samples to transforms that are NOT part of
-        the evaluated families at all (flips/rotation/grayscale), so those
-        never touch -- and can't leak into -- the eval space.
+        the evaluated families at all (rotation/grayscale), so those never
+        touch -- and can't leak into -- the eval space.
     """
 
-    # Probability of drawing k=0/1/2 robustness-family transforms per image.
-    # 1 dominates on purpose ("mostly single-transform training"); 2 is a
-    # deliberate minority ("some compound transforms"); 0 leaves some clean
-    # images in the mix so the model doesn't forget the undistorted signal.
-    num_transforms_weights: dict = field(default_factory=lambda: {0: 0.15, 1: 0.65, 2: 0.20})
+    # Probability that a robustness-family transform is applied at all. With
+    # probability (1 - apply_prob) the image is left clean, so the model keeps
+    # seeing the undistorted signal. When a transform IS applied, exactly one
+    # family is drawn (uniformly) -- transforms are never combined.
+    apply_prob: float = 0.85
 
-    # Probability of instead drawing from the generalization-only pool
-    # (flip/rotate/grayscale) -- mutually exclusive with the block above.
+    # Probability of instead drawing a single transform from the
+    # generalization-only pool (rotate/grayscale) -- mutually exclusive with
+    # the robustness-family draw above.
     generalization_prob: float = 0.15
 
     # Per-family severity ranges sampled at TRAINING time. These intentionally
