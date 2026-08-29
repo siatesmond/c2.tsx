@@ -3,3 +3,6 @@ ai/
 real/
 .DS_Store
 .kilo/
+venv/
+.idea/
+FAKE/
