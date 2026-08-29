@@ -8,8 +8,8 @@ from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-# Project-local augmentation helpers (random/level-based transforms)
-from augmentations import apply_level_augmentation
+# Project-local augmentation helpers (random, family-based training augmentation)
+from augmentations import apply_training_augmentation
 
 # Allow PIL to load images that are truncated/incomplete (common with scraped data).
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -31,33 +31,26 @@ def build_base_transform(image_size, train):
     return transforms.Compose(tf)
 
 
-def find_variants(folder, stem):
-    # Look for pre-generated augmented versions of an image named like "<stem>_l1_*" and "<stem>_l2_*".
-    # Returns a dict {level: [matching_paths]}. Level 0 (original) is always empty here.
-    variants = {0: [], 1: [], 2: []}
-    for lvl in (1, 2):
-        variants[lvl] = sorted(
-            p for p in Path(folder).glob(f"{stem}_l{lvl}_*")
-            if p.suffix.lower() in IMAGE_EXTS
-        )
-    return variants
-
-
 class RealAIDataset(Dataset):
-    def __init__(self, root, split, image_size=224, augment_level=0,
-                 use_stored_aug=True, use_onfly_fallback=True, seed=42):
+    def __init__(self, root, split, image_size=224, augment_level=0, seed=42):
         # Store configuration. Augmentation only applies to the "train" split.
+        # `augment_level` is now just an on/off switch (0 disables, >0 enables);
+        # the actual mix of how many transforms and which families are sampled
+        # per image comes from config.TRAIN_AUG_CFG (see augmentations.py).
         self.root = Path(root)
         self.split = split
         self.image_size = image_size
-        self.augment_level = augment_level if split == "train" else 0
-        self.use_stored_aug = use_stored_aug and split == "train"
-        self.use_onfly_fallback = use_onfly_fallback
+        self.augment = bool(augment_level) and split == "train"
         # Seeded RNG so augmentation choices are deterministic per run.
         self.rng = random.Random(seed)
         self.transform = build_base_transform(image_size, split == "train")
 
         # Build the list of (path, label, class_name) samples by scanning folders.
+        # NOTE: any leftover pre-generated augmentation files (named like
+        # "<stem>_l1_*" / "<stem>_l2_*" from an older pipeline) are still
+        # excluded here so they can never accidentally get counted as extra
+        # train/val/test samples. Augmentation itself is now generated fresh
+        # on the fly every epoch instead of relying on those static files.
         self.samples = []
         for cls in ["real", "ai", "full_synthetic_part2"]:
             # Label encoding: real -> 0, everything AI-generated -> 1.
@@ -69,7 +62,7 @@ class RealAIDataset(Dataset):
                 if p.suffix.lower() not in IMAGE_EXTS:
                     continue  # ignore non-image files
                 if "_l1_" in p.stem or "_l2_" in p.stem:
-                    # Skip augmentation files; they are picked via _pick_path instead.
+                    # Skip old-style pre-generated augmentation files entirely.
                     continue
                 self.samples.append((p, cls_idx, cls))
 
@@ -77,35 +70,13 @@ class RealAIDataset(Dataset):
         # Required by PyTorch Dataset: number of samples.
         return len(self.samples)
 
-    def _pick_path(self, path, cls_dir):
-        # Decide which version of an image to use: original (level 0) or a stored augmentation.
-        if not self.use_stored_aug or self.augment_level <= 0:
-            return path, 0
-        variants = find_variants(cls_dir, path.stem)
-        # Levels we are allowed to sample, e.g. level up to augment_level.
-        allowed = [0]
-        for lvl in range(1, self.augment_level + 1):
-            if variants[lvl]:
-                allowed.append(lvl)
-        if len(allowed) == 1:
-            # No augmentations available -> always use the original.
-            return path, 0
-        # Randomly pick a level, then randomly pick a file at that level.
-        choice = self.rng.choice(allowed)
-        if choice == 0:
-            return path, 0
-        return self.rng.choice(variants[choice]), choice
-
     def _load_sample(self, idx):
         # Load one sample (image + label), applying augmentation when appropriate.
         path, label, cls = self.samples[idx]
-        cls_dir = path.parent
-        chosen, chosen_level = self._pick_path(path, cls_dir)
-        img = Image.open(chosen).convert("RGB")  # force 3-channel RGB
+        img = Image.open(path).convert("RGB")  # force 3-channel RGB
 
-        if chosen_level == 0 and self.augment_level > 0 and self.use_onfly_fallback:
-            # No stored augmentation was chosen, so generate one on the fly.
-            img = apply_level_augmentation(img, self.augment_level, self.rng)
+        if self.augment:
+            img = apply_training_augmentation(img, self.rng)
 
         if self.transform is not None:
             img = self.transform(img)  # resize / to-tensor / normalize

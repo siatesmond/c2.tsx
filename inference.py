@@ -51,10 +51,13 @@ def predict(model, paths, device, image_size, threshold):
         prob = float(torch.sigmoid(model(x)).squeeze(-1).cpu().item())
         label = "ai" if prob >= threshold else "real"
         results.append({
-            "path": str(p),
+            # Required deliverable fields (Section 5.5): "a JSON file containing
+            # image_path and pred for each image" -- pred is the AI-likelihood score.
+            "image_path": str(p),
+            "pred": round(prob, 4),
+            # Extra fields kept for human-readable / debugging convenience.
             "label": label,
             "is_ai": bool(prob >= threshold),
-            "confidence": round(prob, 4),  # AI probability, rounded
             "threshold": threshold,
         })
     return results
@@ -77,7 +80,9 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.5)  # decision boundary
     ap.add_argument("--image_size", type=int, default=224)
     ap.add_argument("--device", type=str, default="auto")
-    ap.add_argument("--json", action="store_true", help="Output JSON")
+    ap.add_argument("--output", type=str, default="predictions.json",
+                    help="Path to write the JSON predictions file (Section 5.5 deliverable)")
+    ap.add_argument("--quiet", action="store_true", help="Suppress the per-image console log")
     args = ap.parse_args()
 
     device = resolve_device(args.device)
@@ -89,13 +94,16 @@ def main():
         raise SystemExit(f"No images found at {args.input}")
     results = predict(model, paths, device, args.image_size, args.threshold)
 
-    if args.json:
-        # Machine-readable output.
-        print(json.dumps(results, indent=2))
-    else:
-        # Human-readable output line per image.
+    # Required deliverable: "The output should be a JSON file containing
+    # image_path and pred for each image." Always written, regardless of flags.
+    out_path = Path(args.output)
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    if not args.quiet:
         for r in results:
-            print(f"{r['path']}  ->  {r['label'].upper()}  (confidence {r['confidence']})")
+            print(f"{r['image_path']}  ->  {r['label'].upper()}  (pred {r['pred']})")
+    print(f"Wrote {len(results)} predictions to {out_path}")
 
 
 if __name__ == "__main__":

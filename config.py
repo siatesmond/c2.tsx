@@ -62,8 +62,10 @@ class TrainConfig:
     monitor: str = "f1"
     # Decision threshold for converting probabilities to class predictions.
     threshold: float = 0.5
-    # Augmentation strength during training: 0 = none, 1 = one mod, 2 = two mods.
-    augment_level: int = 2
+    # Master on/off switch for training-time augmentation. The actual mix of
+    # how many transforms get applied, and which ones, is controlled by
+    # TRAIN_AUG_CFG below (see TrainAugConfig.num_transforms_weights).
+    augment_level: int = 1
     num_workers: int = 4
     seed: int = 42
     # "auto" picks cuda > mps > cpu.
@@ -89,6 +91,47 @@ class RobustnessConfig:
     weight_by_severity: bool = False
 
 
+@dataclass
+class TrainAugConfig:
+    """Controls the on-the-fly training augmentation sampler
+    (augmentations.apply_training_augmentation).
+
+    Priorities encoded here (see augmentations.py docstring for the full
+    rationale):
+      * Cover the same 6 families the robustness eval uses, at RANDOM
+        severities per image rather than one fixed value each.
+      * Keep those random severities away from the exact eval grid points
+        (config.EVAL_SEVERITY_POINTS) so the robustness score measures
+        generalization, not memorization of the eval parameters.
+      * Bias heavily toward a SINGLE transform per image, with compound
+        (2-transform) corruptions as a deliberate minority.
+      * Route a separate slice of samples to transforms that are NOT part of
+        the evaluated families at all (flips/rotation/grayscale), so those
+        never touch -- and can't leak into -- the eval space.
+    """
+
+    # Probability of drawing k=0/1/2 robustness-family transforms per image.
+    # 1 dominates on purpose ("mostly single-transform training"); 2 is a
+    # deliberate minority ("some compound transforms"); 0 leaves some clean
+    # images in the mix so the model doesn't forget the undistorted signal.
+    num_transforms_weights: dict = field(default_factory=lambda: {0: 0.15, 1: 0.65, 2: 0.20})
+
+    # Probability of instead drawing from the generalization-only pool
+    # (flip/rotate/grayscale) -- mutually exclusive with the block above.
+    generalization_prob: float = 0.15
+
+    # Per-family severity ranges sampled at TRAINING time. These intentionally
+    # span (and go a bit beyond) the eval grid so the model sees the general
+    # shape of each corruption family, while _sample_away_from_grid() in
+    # augmentations.py keeps individual draws off the exact eval values.
+    jpeg_quality_range: tuple = (20, 95)
+    blur_sigma_range: tuple = (0.3, 2.5)
+    resize_scale_range: tuple = (0.2, 0.6)
+    noise_sigma_range: tuple = (0.01, 0.12)
+    color_factor_range: tuple = (0.7, 1.3)
+    crop_frac_range: tuple = (0.65, 0.95)
+
+
 # The exact robustness evaluation spec (matches the TikTok TechJam brief):
 # 6 transform families with the specified parameter levels -> 15 transforms total.
 ROBUSTNESS_SPEC = {
@@ -100,9 +143,23 @@ ROBUSTNESS_SPEC = {
     "Center Crop": [("crop", [0.8])],
 }
 
+# Same information as ROBUSTNESS_SPEC, keyed the way augmentations.py's family
+# names are, and used ONLY to steer training severities away from these exact
+# points (see TrainAugConfig / _sample_away_from_grid). This is the guard
+# against accidentally "training on the eval set" in parameter space.
+EVAL_SEVERITY_POINTS = {
+    "jpeg": [90, 70, 50, 30],
+    "blur": [0.5, 1.0, 2.0],
+    "resize": [0.5, 0.25],
+    "noise": [0.02, 0.05, 0.10],
+    "color": [1.2, 0.8],
+    "crop": [0.8],
+}
+
 
 # Singleton config instances imported across the project.
 MODEL_CFG = ModelConfig()
 TRAIN_CFG = TrainConfig()
 EVAL_CFG = EvalConfig()
 ROBUSTNESS_CFG = RobustnessConfig()
+TRAIN_AUG_CFG = TrainAugConfig()

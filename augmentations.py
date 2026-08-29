@@ -1,20 +1,42 @@
 """Image transformation primitives and augmentation sets.
 
 Provides:
-  * Reusable PIL-based transforms (JPEG, blur, resize, noise, color jitter, crop).
-  * `AUGMENT_POOL`  - the pool sampled by `apply_level_augmentation` for on-the-fly
-                       training augmentation (levels 0/1/2).
-  * `get_robustness_transforms()` - the fixed 15-transform set used by the
-                       evaluation robustness score (matches the hackathon spec).
+  * Reusable PIL-based transforms (JPEG, blur, resize, noise, color jitter, crop, ...).
+  * `apply_training_augmentation()` - the sampler used on-the-fly during training.
+  * `get_robustness_transforms()` - the FIXED 15-transform set used by the
+    evaluation robustness score (matches the hackathon spec exactly, unchanged).
+
+Design goals for the training sampler (see config.TRAIN_AUG_CFG):
+  1. Cover the same 6 families the robustness eval measures (JPEG, blur, resize,
+     noise, color jitter, crop) so training exposure roughly matches the eval space.
+  2. Sample a *random* severity per family per image, instead of one fixed value,
+     and deliberately keep those draws away from the exact discrete points the
+     eval harness tests at (see config.EVAL_SEVERITY_POINTS) -- training on the
+     exact eval grid would make the robustness score partly measure memorization
+     of those specific parameters rather than genuine generalization.
+  3. Mostly apply a SINGLE family per image (level 1), with compound/stacked
+     corruptions (level 2) as a minority case -- closer to how real-world re-uploads
+     usually pick up one degradation, occasionally two.
+  4. Keep a separate "generalization" pool (small rotation, grayscale) that
+     is NOT part of the evaluated families at all. This adds useful invariances
+     without ever overlapping the eval space, so it can't inflate/deflate the
+     robustness score in either direction. Horizontal/vertical flips are
+     deliberately excluded -- for AI-detection, orientation can itself be a
+     useful signal (asymmetric artifacts, mirrored text), so we don't want
+     the model to become invariant to it.
 """
 
 import io
-import random
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
-from config import ROBUSTNESS_CFG
+from config import EVAL_SEVERITY_POINTS, TRAIN_AUG_CFG
+
+# ---------------------------------------------------------------------------
+# Core transform primitives (shared by training augmentation AND the fixed
+# robustness eval set below -- keep these signatures stable).
+# ---------------------------------------------------------------------------
 
 
 def jpeg_compress(img, quality):
@@ -61,57 +83,26 @@ def center_crop(img, frac):
     return img.crop((left, top, left + cw, top + ch))
 
 
-def hflip(img):
-    """Horizontal flip."""
-    return img.transpose(Image.FLIP_LEFT_RIGHT)
+def slight_rotate(img, degrees):
+    """Small rotation, resample-filled, size preserved (camera-tilt realism)."""
+    return img.rotate(degrees, resample=Image.BICUBIC, expand=False, fillcolor=(127, 127, 127))
 
 
-def vflip(img):
-    """Vertical flip."""
-    return img.transpose(Image.FLIP_TOP_BOTTOM)
+def grayscale(img):
+    """Desaturate fully (some re-shares/filters strip color)."""
+    return ImageOps.grayscale(img).convert("RGB")
 
 
-# Training augmentation pool (sampled by apply_level_augmentation for levels 1/2).
-# Covers the same transform families used in the robustness evaluation.
-AUGMENT_POOL = [
-    ("horizontal_flip", hflip),
-    ("vertical_flip", vflip),
-    ("jpeg_70", lambda im: jpeg_compress(im, 70)),
-    ("blur_10", lambda im: gaussian_blur(im, 1.0)),
-    ("resize_05", lambda im: resize_down_up(im, 0.5)),
-    ("noise_005", lambda im: gaussian_noise(im, 0.05)),
-    ("color_jitter_up", lambda im: color_jitter(im, 1.2)),
-    ("color_jitter_down", lambda im: color_jitter(im, 0.8)),
-    ("center_crop_80", lambda im: center_crop(im, 0.8)),
-]
-
-
-def get_augment_names():
-    """Return the names of the training augmentation pool."""
-    return [n for n, _ in AUGMENT_POOL]
-
-
-def apply_level_augmentation(img, level, rng=None):
-    """Apply `level` random transforms from AUGMENT_POOL (level 0 = original)."""
-    if level <= 0:
-        return img
-    rng = rng or random.Random()
-    chosen = rng.sample(range(len(AUGMENT_POOL)), k=min(level, len(AUGMENT_POOL)))
-    for idx in chosen:
-        _, fn = AUGMENT_POOL[idx]
-        img = fn(img)
-    return img
+# ---------------------------------------------------------------------------
+# Fixed robustness evaluation set -- DO NOT change 
+#   JPEG q in {90,70,50,30}, Blur sigma in {0.5,1.0,2.0},
+#   Resize scale in {0.5,0.25}, Noise sigma in {0.02,0.05,0.10},
+#   Color jitter +/-20%, Center crop 80%.
+# ---------------------------------------------------------------------------
 
 
 def get_robustness_transforms(severity=None):
-    """Return the fixed 15-transform robustness evaluation set.
-
-    Keys are transform names; values are (family, callable) pairs. The families
-    and parameters exactly match the hackathon robustness spec:
-      JPEG q in {90,70,50,30}, Blur sigma in {0.5,1.0,2.0},
-      Resize scale in {0.5,0.25}, Noise sigma in {0.02,0.05,0.10},
-      Color jitter +/-20%, Center crop 80%.
-    """
+    """Return the fixed 15-transform robustness evaluation set."""
     t = {}
     for q in (90, 70, 50, 30):
         t[f"jpeg_q{q}"] = ("compression", lambda im, q=q: jpeg_compress(im, q))
@@ -125,3 +116,103 @@ def get_robustness_transforms(severity=None):
     t["color_jitter_down"] = ("photometric", lambda im: color_jitter(im, 0.8))
     t["center_crop_80"] = ("spatial", lambda im: center_crop(im, 0.8))
     return t
+
+
+# ---------------------------------------------------------------------------
+# Training-time augmentation sampler.
+# ---------------------------------------------------------------------------
+
+# The 6 robustness families, mapped to (callable, severity-range-attr-name,
+# eval-grid key). Keeping this table means adding/removing a family only
+# requires one line here, everything else (sampling, weighting) follows.
+FAMILY_FUNCS = {
+    "jpeg": jpeg_compress,
+    "blur": gaussian_blur,
+    "resize": resize_down_up,
+    "noise": gaussian_noise,
+    "color": color_jitter,
+    "crop": center_crop,
+}
+FAMILIES = list(FAMILY_FUNCS.keys())
+
+GENERALIZATION_POOL = [
+    ("slight_rotation", lambda im, rng: slight_rotate(im, rng.uniform(-15, 15))),
+    ("grayscale", lambda im, rng: grayscale(im)),
+]
+
+
+def _sample_away_from_grid(rng, lo, hi, grid_points, margin):
+    """Uniformly sample in [lo, hi], retrying if the draw lands within `margin`
+    of any exact value the robustness eval will test at. This is what keeps
+    training severities "eval-adjacent but not identical" -- covering the same
+    realistic range without literally training on the eval grid points.
+    """
+    for _ in range(25):
+        val = rng.uniform(lo, hi)
+        if all(abs(val - g) >= margin for g in grid_points):
+            return val
+    return val  # fall back to last draw if we couldn't avoid the grid (rare)
+
+
+def _draw_severity(family, rng, cfg):
+    grid = EVAL_SEVERITY_POINTS[family]
+    if family == "jpeg":
+        lo, hi = cfg.jpeg_quality_range
+        q = _sample_away_from_grid(rng, lo, hi, grid, margin=4)
+        return int(round(q))
+    if family == "blur":
+        lo, hi = cfg.blur_sigma_range
+        return _sample_away_from_grid(rng, lo, hi, grid, margin=0.12)
+    if family == "resize":
+        lo, hi = cfg.resize_scale_range
+        return _sample_away_from_grid(rng, lo, hi, grid, margin=0.04)
+    if family == "noise":
+        lo, hi = cfg.noise_sigma_range
+        return _sample_away_from_grid(rng, lo, hi, grid, margin=0.008)
+    if family == "color":
+        lo, hi = cfg.color_factor_range
+        return _sample_away_from_grid(rng, lo, hi, grid, margin=0.05)
+    if family == "crop":
+        lo, hi = cfg.crop_frac_range
+        return _sample_away_from_grid(rng, lo, hi, grid, margin=0.03)
+    raise ValueError(f"Unknown family: {family}")
+
+
+def apply_family_transform(img, family, rng, cfg):
+    fn = FAMILY_FUNCS[family]
+    severity = _draw_severity(family, rng, cfg)
+    return fn(img, severity)
+
+
+def apply_training_augmentation(img, rng, aug_cfg=None):
+    """Sample one realistic training augmentation for a single image.
+
+    - With probability `aug_cfg.generalization_prob`, draw a single transform
+      from GENERALIZATION_POOL (flip/rotate/grayscale) -- never overlaps the
+      evaluated families.
+    - Otherwise, draw a transform COUNT k from `aug_cfg.num_transforms_weights`
+      (k=0 no-op, k=1 single corruption -- the common case, k=2 a compound/
+      stacked corruption -- a minority case), then apply that many DISTINCT
+      robustness families, each at a randomly sampled severity that avoids the
+      exact eval grid points.
+    """
+    aug_cfg = aug_cfg or TRAIN_AUG_CFG
+
+    if rng.random() < aug_cfg.generalization_prob:
+        _, fn = rng.choice(GENERALIZATION_POOL)
+        return fn(img, rng)
+
+    weights = aug_cfg.num_transforms_weights
+    k = rng.choices(list(weights.keys()), weights=list(weights.values()), k=1)[0]
+    if k <= 0:
+        return img
+
+    families = rng.sample(FAMILIES, k=min(k, len(FAMILIES)))
+    for fam in families:
+        img = apply_family_transform(img, fam, rng, aug_cfg)
+    return img
+
+
+def get_augment_names():
+    """Names of everything the training sampler can draw from (for logging)."""
+    return FAMILIES + [n for n, _ in GENERALIZATION_POOL]
