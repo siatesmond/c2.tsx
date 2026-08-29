@@ -10,6 +10,12 @@ Pillow>=9.0
 scikit-learn>=1.2
 pandas>=1.5
 
+# Frozen CLIP vision encoder for the hybrid detector (`--model hybrid_clip`).
+# Pulls in huggingface-hub; the ViT-B/32 checkpoint (~600MB) is downloaded to
+# the HF cache on first use, so that run needs internet access. Not required
+# for the EfficientNet-only path.
+transformers>=4.40
+
 # Training progress bars and plotting of robustness results.
 tqdm>=4.64
 matplotlib>=3.6

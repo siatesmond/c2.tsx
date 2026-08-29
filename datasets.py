@@ -10,6 +10,8 @@ from torchvision import transforms
 
 # Project-local augmentation helpers (random, family-based training augmentation)
 from augmentations import apply_training_augmentation
+from config import HYBRID_CFG, HYBRID_MODEL_NAME
+from frequency import stack_image_and_spectrogram
 
 # Allow PIL to load images that are truncated/incomplete (common with scraped data).
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -31,19 +33,49 @@ def build_base_transform(image_size, train):
     return transforms.Compose(tf)
 
 
+class HybridTransform:
+    """Transform for the hybrid detector: resize -> ToTensor([0,1]) -> append
+    the per-patch FFT spectrogram as a 4th channel.
+
+    The model applies CLIP's own normalisation and the high-pass residual, so
+    this stage intentionally leaves the RGB channels un-normalised. Written as
+    a picklable class (not a lambda) so it works inside DataLoader workers.
+    """
+
+    def __init__(self, image_size, freq_grid=HYBRID_CFG.freq_grid):
+        self.resize = transforms.Resize((image_size, image_size))
+        self.to_tensor = transforms.ToTensor()
+        self.freq_grid = freq_grid
+
+    def __call__(self, img):
+        rgb01 = self.to_tensor(self.resize(img))          # (3, H, W) in [0, 1]
+        return stack_image_and_spectrogram(rgb01, grid=self.freq_grid)  # (4, H, W)
+
+
+def build_transform(image_size, train, model_name=None):
+    """Pick the right image pipeline for the configured model."""
+    if model_name == HYBRID_MODEL_NAME:
+        return HybridTransform(image_size)
+    return build_base_transform(image_size, train)
+
+
 class RealAIDataset(Dataset):
-    def __init__(self, root, split, image_size=224, augment_level=0, seed=42):
+    def __init__(self, root, split, image_size=224, augment_level=0, seed=42,
+                 model_name=None):
         # Store configuration. Augmentation only applies to the "train" split.
         # `augment_level` is now just an on/off switch (0 disables, >0 enables);
         # the actual mix of how many transforms and which families are sampled
         # per image comes from config.TRAIN_AUG_CFG (see augmentations.py).
+        # `model_name` selects the image pipeline: the hybrid detector needs the
+        # 4-channel (RGB + FFT spectrogram) tensor, everything else the
+        # ImageNet-normalised 3-channel one.
         self.root = Path(root)
         self.split = split
         self.image_size = image_size
         self.augment = bool(augment_level) and split == "train"
         # Seeded RNG so augmentation choices are deterministic per run.
         self.rng = random.Random(seed)
-        self.transform = build_base_transform(image_size, split == "train")
+        self.transform = build_transform(image_size, split == "train", model_name)
 
         # Build the list of (path, label, class_name) samples by scanning folders.
         # NOTE: any leftover pre-generated augmentation files (named like
@@ -91,6 +123,9 @@ class RealAIDataset(Dataset):
             except Exception:
                 # If a file is unreadable, fall back to a random other sample.
                 idx = self.rng.randrange(len(self.samples))
-        # If everything keeps failing, return a blank (black) image with label 0.
-        img = torch.zeros((3, self.image_size, self.image_size))
+        # If everything keeps failing, return a blank image with label 0.
+        # Match the channel count the transform would have produced (4 for the
+        # hybrid RGB+spectrogram tensor, 3 otherwise).
+        n_ch = 4 if isinstance(self.transform, HybridTransform) else 3
+        img = torch.zeros((n_ch, self.image_size, self.image_size))
         return img, torch.tensor(0.0, dtype=torch.float32)

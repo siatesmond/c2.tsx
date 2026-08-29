@@ -9,17 +9,21 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import (CosineAnnealingWarmRestarts,
                                        ReduceLROnPlateau, StepLR)
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm  # progress bar helper
 
 # Project-local modules
-from config import (BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, TRAIN_CFG,
+from config import (BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, TRAIN_CFG, ROBUSTNESS_CFG,
                     MODEL_CFG, TrainConfig, weights_path)
 from datasets import RealAIDataset  # custom dataset that loads real vs AI images
-from metrics import classification_metrics  # computes F1/accuracy/precision/recall
+from metrics import (classification_metrics, robustness_score, final_score,
+                     optimal_threshold)
+from augmentations import get_robustness_transforms
+from evaluate import predict_probs, error_analysis
 from model import build_model  # factory that constructs the detector network
 
 
@@ -50,14 +54,41 @@ def make_scheduler(optimizer, cfg):
     raise ValueError(f"Unknown scheduler: {cfg.scheduler}")
 
 
-def build_loaders(cfg, root=DATA_ROOT):
+def _subsample(ds, n, seed):
+    # Shrink a dataset in place to ~n samples, kept label-balanced where
+    # possible. Used by the --limit smoke-test flag so a full pipeline run
+    # (data -> CLIP -> train step -> checkpoint -> eval) takes minutes.
+    if not n or n >= len(ds.samples):
+        return
+    rng = random.Random(seed)
+    pos = [s for s in ds.samples if s[1] == 1]
+    neg = [s for s in ds.samples if s[1] == 0]
+    rng.shuffle(pos)
+    rng.shuffle(neg)
+    half = max(1, n // 2)
+    picked = pos[:half] + neg[:half]
+    rng.shuffle(picked)
+    ds.samples = picked
+
+
+def build_loaders(cfg, root=DATA_ROOT, limit=None):
     # Create the training and validation datasets, then wrap them in DataLoaders.
     # Training uses the configured augmentation level; validation never augments.
-    train_ds = RealAIDataset(root, "train", cfg.image_size, cfg.augment_level, seed=cfg.seed)
-    val_ds = RealAIDataset(root, "val", cfg.image_size, 0, seed=cfg.seed)
+    # `model_name` picks the image pipeline (hybrid_clip needs the 4-channel
+    # RGB+FFT tensor; everything else the ImageNet-normalised 3-channel one).
+    train_ds = RealAIDataset(root, "train", cfg.image_size, cfg.augment_level,
+                             seed=cfg.seed, model_name=MODEL_CFG.name)
+    val_ds = RealAIDataset(root, "val", cfg.image_size, 0,
+                           seed=cfg.seed, model_name=MODEL_CFG.name)
+    if limit:
+        # Cap train at `limit`, val at a fifth of it (min 10) -- enough to get a
+        # real validation metric without slowing the smoke test down.
+        _subsample(train_ds, limit, cfg.seed)
+        _subsample(val_ds, max(10, limit // 5), cfg.seed + 1)
+        print(f"--limit {limit}: using {len(train_ds)} train / {len(val_ds)} val samples")
     if len(train_ds) == 0:
         # Guard so we fail loudly instead of training on an empty dataset.
-        raise SystemExit("Training set is empty. Add images to data/train/real and data/train/ai.")
+        raise SystemExit(f"Training set is empty. Expected images under {Path(root) / 'train'}/{{real,ai}}.")
     # Training loader shuffles and drops the last partial batch for stable batch stats.
     train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                           num_workers=cfg.num_workers, drop_last=True)
@@ -83,12 +114,12 @@ def evaluate_loader(model, loader, device, threshold):
     # Run the model over an entire loader and collect ground-truth labels + predicted probabilities.
     model.eval()  # switch to evaluation mode (affects dropout / batchnorm)
     y_true, y_prob = [], []  # lists of true labels and predicted probabilities
-    for x, y in loader:
+    for x, y in tqdm(loader, desc="eval", leave=False):
         x = x.to(device)
         # model outputs raw logits -> sigmoid converts to a probability in [0, 1]
         prob = torch.sigmoid(model(x)).squeeze(-1).cpu().numpy()
         y_true.extend(y.numpy().astype(int).tolist())
-        y_prob.extend(prob.tolist())
+        y_prob.extend(np.atleast_1d(prob).tolist())
     # Compute precision/recall/F1/accuracy from the collected predictions.
     return classification_metrics(y_true, y_prob, threshold)
 
@@ -97,7 +128,9 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler, use_amp):
     # Train the model for a single epoch and return the average loss over the dataset.
     model.train()  # enable training-mode behaviour (dropout / batchnorm update)
     running_loss = 0.0
-    for x, y in tqdm(loader, desc="train", leave=False):
+    seen = 0
+    pbar = tqdm(loader, desc="train", leave=False)
+    for x, y in pbar:
         x, y = x.to(device), y.to(device).unsqueeze(1)  # move batch to device, shape labels (B,1)
         optimizer.zero_grad()  # clear gradients from the previous step
         if use_amp and device.type == "cuda":
@@ -117,37 +150,116 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler, use_amp):
             optimizer.step()
         # Accumulate loss weighted by the number of samples in this batch.
         running_loss += loss.item() * x.size(0)
+        seen += x.size(0)
+        # Live running-mean loss on the progress bar.
+        pbar.set_postfix(loss=f"{running_loss / max(1, seen):.4f}")
     # Divide by total samples to get the mean loss for the epoch.
     return running_loss / max(1, len(loader.dataset))
 
 
 @torch.no_grad()
-def validation_confidence(model, loader, device, threshold):
-    # Like evaluate_loader, but also tracks the model's average confidence on
-    # correct vs. incorrect predictions (a useful calibration signal).
+def validation_confidence(model, loader, device):
+    # ROC-AUC is threshold-independent and stays the headline validation metric;
+    # the hard metrics (accuracy/F1/...) and the correct-vs-wrong confidence
+    # breakdown are computed at the ROC-optimal decision threshold (Youden's J).
     model.eval()
-    y_true, y_prob, correct_conf, wrong_conf = [], [], [], []
-    for x, y in loader:
+    y_true, y_prob = [], []
+    for x, y in tqdm(loader, desc="val", leave=False):
         x = x.to(device)
         prob = torch.sigmoid(model(x)).squeeze(-1).cpu().numpy()
-        yt = y.numpy().astype(int)
-        pred = (prob >= threshold).astype(int)  # threshold the probability into a class
-        for t, p, pr in zip(yt, pred, prob):
-            if p == t:
-                correct_conf.append(pr)  # store confidence for correct predictions
-            else:
-                wrong_conf.append(pr)  # store confidence for wrong predictions
-        y_true.extend(yt.tolist())
-        y_prob.extend(prob.tolist())
-    metrics, _ = classification_metrics(y_true, y_prob, threshold)
-    # Extra diagnostic fields describing how confident the model generally is.
+        y_true.extend(y.numpy().astype(int).tolist())
+        y_prob.extend(np.atleast_1d(prob).tolist())
+    best_thr = optimal_threshold(y_true, y_prob)
+    metrics, y_pred = classification_metrics(y_true, y_prob, best_thr)
+    correct_conf, wrong_conf = [], []
+    for t, p, pr in zip(y_true, y_pred, y_prob):
+        (correct_conf if p == t else wrong_conf).append(pr)
+    metrics["threshold"] = best_thr  # record the operating point that was used
     metrics["confidence_score"] = float(np.mean(y_prob))  # average predicted probability
     metrics["mean_conf_correct"] = float(np.mean(correct_conf)) if correct_conf else float("nan")
     metrics["mean_conf_wrong"] = float(np.mean(wrong_conf)) if wrong_conf else float("nan")
-    return metrics
+    return metrics, y_true, y_prob
 
 
-def main(cfg=TRAIN_CFG):
+class _ValSampleDataset(Dataset):
+    # Wraps the validation samples so they can be fed through a custom transform
+    # (used for the per-epoch robustness evaluation on the val split).
+    def __init__(self, samples, transform):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        p, label, _cls = self.samples[idx]
+        img = Image.open(p).convert("RGB")
+        return self.transform(img), label, str(p)
+
+
+class _TransformedView(Dataset):
+    # Applies a single robustness transform (on top of the base pipeline) to each
+    # validation image, mirroring evaluate.py's robustness evaluation.
+    def __init__(self, samples, fn, base_tf):
+        self.samples = samples
+        self.fn = fn
+        self.base_tf = base_tf
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        p, label, _cls = self.samples[idx]
+        img = Image.open(p).convert("RGB")
+        img = self.fn(img)
+        return self.base_tf(img), label, str(p)
+
+
+@torch.no_grad()
+def evaluate_val_robustness(model, val_ds, device, batch_size, severity,
+                            max_samples=2000):
+    # Per-transform ROC-AUC on the validation set. This runs 15 full passes, so
+    # on a large val split we sample a fixed label-balanced subset (default
+    # 2000) -- enough for a stable per-epoch robustness signal without turning
+    # the check into a multi-hour job. Set max_samples=0 to use all of val.
+    base_tf = val_ds.transform
+    samples = val_ds.samples
+    if max_samples and len(samples) > max_samples:
+        rng = random.Random(0)  # fixed subset so the metric is comparable across epochs
+        pos = [s for s in samples if s[1] == 1]
+        neg = [s for s in samples if s[1] == 0]
+        rng.shuffle(pos)
+        rng.shuffle(neg)
+        half = max(1, max_samples // 2)
+        samples = pos[:half] + neg[:half]
+    rob = get_robustness_transforms(severity)
+    per_transform_auc = {}
+    for name, (category, fn) in rob.items():
+        loader = DataLoader(_TransformedView(samples, fn, base_tf),
+                            batch_size=batch_size, shuffle=False, num_workers=0)
+        probs, labels, _ = predict_probs(model, loader, device, desc=name)
+        m, _ = classification_metrics(labels, probs, 0.5)
+        per_transform_auc[name] = m["roc_auc"]
+    return per_transform_auc
+
+
+def ask_continue(epoch, num_epochs, enabled=True):
+    # Interactive early-stop check. Skipped entirely when disabled (--no_prompt)
+    # or when stdin is not a real terminal, so piped/non-interactive runs keep
+    # going automatically.
+    if not enabled or not sys.stdin.isatty():
+        return True
+    try:
+        ans = input(f"\nEpoch {epoch}/{num_epochs}: continue training? "
+                    f"[Enter/Y = yes, n = stop now, b = stop & keep best] ").strip().lower()
+    except EOFError:
+        return True
+    if ans in ("n", "no", "b"):
+        return False
+    return True
+
+
+def main(cfg=TRAIN_CFG, data_root=DATA_ROOT, limit=None, prompt=True):
     # --- Setup ---------------------------------------------------------------
     device = resolve_device(cfg.device)
     # Checkpoint path is derived from the model variant (e.g. efficientnet_b0
@@ -162,7 +274,7 @@ def main(cfg=TRAIN_CFG):
     random.seed(cfg.seed)
 
     # --- Data, model, loss, optimizer ---------------------------------------
-    train_dl, val_dl = build_loaders(cfg)
+    train_dl, val_dl = build_loaders(cfg, root=data_root, limit=limit)
     model = build_model(MODEL_CFG, device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
@@ -174,7 +286,12 @@ def main(cfg=TRAIN_CFG):
         print(f"Class imbalance -> pos_weight (ai): {pos_weight.item():.1f}")
     # BCEWithLogitsLoss expects raw logits and applies sigmoid internally (numerically safer).
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    # Only optimise parameters that require grad -- the hybrid model's CLIP
+    # encoder is frozen, so its ~87M params must be excluded from the optimiser.
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    n_trainable = sum(p.numel() for p in trainable)
+    print(f"Trainable parameters: {n_trainable:,}")
+    optimizer = AdamW(trainable, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     scheduler = make_scheduler(optimizer, cfg)
     # GradScaler is only meaningful with AMP on CUDA; disabled elsewhere.
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == "cuda")
@@ -188,13 +305,32 @@ def main(cfg=TRAIN_CFG):
     for epoch in range(1, cfg.num_epochs + 1):
         loss = train_epoch(model, train_dl, optimizer, criterion, device, scaler, cfg.amp)
         if val_dl is not None:
-            # Evaluate on the validation set using the configured threshold.
-            val_metrics = validation_confidence(model, val_dl, device, cfg.threshold)
+            # Evaluate on the validation set. ROC-AUC is threshold-independent and
+            # is the primary metric; hard metrics use the ROC-optimal threshold.
+            val_metrics, y_true, y_prob = validation_confidence(model, val_dl, device)
             # The metric we track for "best model" / scheduling decisions.
             monitor_val = val_metrics.get(cfg.monitor, -float("inf"))
             print(f"Epoch {epoch:02d}/{cfg.num_epochs} | loss {loss:.4f} | "
-                  f"val_f1 {val_metrics['f1']:.4f} | val_acc {val_metrics['accuracy']:.4f} | "
+                  f"val_roc_auc {val_metrics['roc_auc']:.4f} | val_acc {val_metrics['accuracy']:.4f} | "
+                  f"thr {val_metrics['threshold']:.3f} | "
                   f"conf {val_metrics['confidence_score']:.4f} | lr {optimizer.param_groups[0]['lr']:.2e}")
+
+            # --- Per-epoch diagnostics: error analysis + robustness + final score ---
+            err = error_analysis(np.array(y_prob), np.array(y_true), None, val_metrics["threshold"])
+            print(f"  errors: FP(real->AI)={err['false_positives']} "
+                  f"(conf {err['fp_mean_confidence']}) | "
+                  f"FN(AI->real)={err['false_negatives']} (conf {err['fn_mean_confidence']})")
+            print(f"  -> {err['interpretation']}")
+
+            if (epoch % cfg.robust_eval_every) == 0:
+                per_t_auc = evaluate_val_robustness(model, val_dl.dataset, device,
+                                                    cfg.batch_size, ROBUSTNESS_CFG.severity)
+                rob = robustness_score(per_t_auc, ROBUSTNESS_CFG.weight_by_severity)
+                score = final_score(val_metrics["roc_auc"], rob["robustness_score"])
+                worst = sorted(per_t_auc.items(), key=lambda kv: kv[1])[:3]
+                print(f"  robustness AUC: {rob['robustness_score']:.4f} | "
+                      f"final score (0.5*AUC_clean+0.5*AUC_robust): {score:.4f}")
+                print(f"  weakest transforms: " + ", ".join(f"{n}={a:.3f}" for n, a in worst))
         else:
             # No validation set: treat negative training loss as the monitor signal.
             monitor_val = -loss
@@ -234,6 +370,12 @@ def main(cfg=TRAIN_CFG):
                 print(f"Early stopping: no improvement for {epochs_no_improve} epochs.")
                 break
 
+        # --- Interactive early stop ------------------------------------------
+        # After each epoch, let the user stop once results look acceptable.
+        if not ask_continue(epoch, cfg.num_epochs, enabled=prompt):
+            print("Stopping early by user request; best weights are kept.")
+            break
+
     # --- Teardown -----------------------------------------------------------
     # Write the full training history to a JSON file next to the weights.
     with open(weights_out.with_suffix(".history.json"), "w") as f:
@@ -254,9 +396,21 @@ def parse_args():
     ap.add_argument("--device", type=str, default=TRAIN_CFG.device)
     ap.add_argument("--num_workers", type=int, default=TRAIN_CFG.num_workers)
     ap.add_argument("--seed", type=int, default=TRAIN_CFG.seed)
+    ap.add_argument("--robust_eval_every", type=int, default=TRAIN_CFG.robust_eval_every,
+                    help="Run the validation robustness eval every N epochs (1 = every "
+                         "epoch). It is a full val pass per transform (15), so raise "
+                         "this for hybrid_clip on MPS/CPU.")
+    ap.add_argument("--no_prompt", action="store_true",
+                    help="Disable the interactive continue/stop prompt after each epoch.")
     ap.add_argument("--model", type=str, default=MODEL_CFG.name,
-                    help="TorchVision EfficientNet variant, e.g. efficientnet_b0/b1/b2. "
-                         "Each variant is saved to its own checkpoint file.")
+                    help="TorchVision EfficientNet variant (e.g. efficientnet_b0/b1/b2) "
+                         "or 'hybrid_clip'. Each variant is saved to its own checkpoint file.")
+    ap.add_argument("--data_root", type=str, default=str(DATA_ROOT),
+                    help="Dataset root containing {train,val}/{real,ai}. Point at a small "
+                         "subset folder for a quick pipeline smoke test.")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="Cap the number of training samples (val scaled down too) for a "
+                         "fast end-to-end test run. Omit for a full run.")
     return ap.parse_args()
 
 
@@ -271,6 +425,6 @@ if __name__ == "__main__":
         num_epochs=a.epochs, batch_size=a.batch_size, learning_rate=a.lr,
         augment_level=a.augment_level, scheduler=a.scheduler, monitor=a.monitor,
         early_stopping_patience=a.patience, device=a.device, seed=a.seed,
-        num_workers=a.num_workers,
+        num_workers=a.num_workers, robust_eval_every=a.robust_eval_every,
     )
-    main(cfg)
+    main(cfg, data_root=Path(a.data_root), limit=a.limit, prompt=not a.no_prompt)
