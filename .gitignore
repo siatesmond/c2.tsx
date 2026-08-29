@@ -1,1 +1,5 @@
 data/
+ai/
+real/
+.DS_Store
+.kilo/

@@ -12,7 +12,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from augmentations import get_robustness_transforms
 from config import BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, ROBUSTNESS_CFG
-from metrics import classification_metrics, robustness_score
+from metrics import (classification_metrics, robustness_score, final_score,
+                     optimal_threshold)
 from model import build_model, load_best_weights
 
 
@@ -71,7 +72,7 @@ def predict_probs(model, loader, device):
 def evaluate_robustness(model, dataset, device, batch_size, threshold, severity):
     base_tf = dataset.transform
     rob = get_robustness_transforms(severity)
-    per_transform_acc = {}
+    per_transform_auc = {}
     per_transform_error = {}
     total = len(dataset)
     for name, (category, fn) in rob.items():
@@ -80,10 +81,10 @@ def evaluate_robustness(model, dataset, device, batch_size, threshold, severity)
             batch_size=batch_size, shuffle=False, num_workers=0)
         probs, labels, _ = predict_probs(model, loader, device)
         preds = (probs >= threshold).astype(int)
-        acc = float((preds == labels).mean()) if total else 0.0
-        per_transform_acc[name] = acc
+        m, _ = classification_metrics(labels, probs, threshold)
+        per_transform_auc[name] = m["roc_auc"]
         per_transform_error[name] = int((preds != labels).sum())
-    return per_transform_acc, per_transform_error
+    return per_transform_auc, per_transform_error
 
 
 class _TransformedView(Dataset):
@@ -102,19 +103,21 @@ class _TransformedView(Dataset):
         return self.base_tf(img), label, str(p)
 
 
-def error_analysis(probs, labels, paths, threshold):
+def error_analysis(probs, labels, paths=None, threshold=0.5):
     preds = (probs >= threshold).astype(int)
     fp_idx = np.where((preds == 1) & (labels == 0))[0]
     fn_idx = np.where((preds == 0) & (labels == 1))[0]
     conf_fp = probs[fp_idx] if len(fp_idx) else np.array([])
     conf_fn = probs[fn_idx] if len(fn_idx) else np.array([])
+    fp_examples = [paths[i] for i in fp_idx[:20]] if paths is not None else []
+    fn_examples = [paths[i] for i in fn_idx[:20]] if paths is not None else []
     return {
         "false_positives": int(len(fp_idx)),
         "false_negatives": int(len(fn_idx)),
         "fp_mean_confidence": float(conf_fp.mean()) if len(conf_fp) else None,
         "fn_mean_confidence": float(conf_fn.mean()) if len(conf_fn) else None,
-        "fp_examples": [paths[i] for i in fp_idx[:20]],
-        "fn_examples": [paths[i] for i in fn_idx[:20]],
+        "fp_examples": fp_examples,
+        "fn_examples": fn_examples,
         "interpretation": _interpret(len(fp_idx), len(fn_idx), len(labels)),
     }
 
@@ -147,26 +150,34 @@ def main(weights=BEST_WEIGHTS, data_root=DATA_ROOT, cfg=EVAL_CFG,
 
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
     probs, labels, paths = predict_probs(model, loader, device)
-    metrics, _ = classification_metrics(labels, probs, cfg.threshold)
+    # ROC-AUC is the primary metric and is threshold-independent. Pick the
+    # ROC-optimal decision threshold (Youden's J) for all threshold-dependent
+    # metrics and error counts so they reflect the best operating point.
+    best_thr = optimal_threshold(labels, probs)
+    metrics, _ = classification_metrics(labels, probs, best_thr)
+    metrics["threshold"] = best_thr
 
     rob_spec = get_robustness_transforms(rob_cfg.severity)
-    per_t_acc, per_t_err = evaluate_robustness(model, ds, device, cfg.batch_size,
-                                               cfg.threshold, rob_cfg.severity)
-    rob = robustness_score(per_t_acc, rob_cfg.weight_by_severity)
+    per_t_auc, per_t_err = evaluate_robustness(model, ds, device, cfg.batch_size,
+                                               best_thr, rob_cfg.severity)
+    rob = robustness_score(per_t_auc, rob_cfg.weight_by_severity)
 
     by_family = {}
-    for name, acc in per_t_acc.items():
+    for name, auc in per_t_auc.items():
         cat = rob_spec.get(name, ("other", None))[0]
-        by_family.setdefault(cat, []).append(acc)
+        by_family.setdefault(cat, []).append(auc)
     robustness_by_family = {c: float(np.mean(v)) for c, v in by_family.items()}
 
-    errors = error_analysis(probs, labels, paths, cfg.threshold)
+    errors = error_analysis(probs, labels, paths, best_thr)
+
+    score = final_score(metrics["roc_auc"], rob["robustness_score"])
 
     report = {
-        "threshold": cfg.threshold,
+        "threshold": best_thr,
         "clean_metrics": metrics,
         "robustness": rob,
         "robustness_by_family": robustness_by_family,
+        "final_score": score,
         "error_analysis": errors,
         "per_transform_errors": per_t_err,
     }
@@ -175,14 +186,16 @@ def main(weights=BEST_WEIGHTS, data_root=DATA_ROOT, cfg=EVAL_CFG,
     with open(out, "w") as f:
         json.dump(report, f, indent=2)
 
+    print(f"=== ROC-optimal decision threshold (Youden's J): {best_thr:.4f} ===")
     print("=== Clean test metrics ===")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}")
-    print(f"=== Robustness score: {rob['robustness_score']:.4f} (mean acc {rob['mean_accuracy']:.4f}) ===")
-    for fam, acc in sorted(robustness_by_family.items()):
-        print(f"  {fam}: {acc:.4f}")
-    worst = sorted(per_t_acc.items(), key=lambda kv: kv[1])[:3]
+    print(f"=== Robustness score: {rob['robustness_score']:.4f} (mean AUC {rob['mean_auc']:.4f}) ===")
+    for fam, auc in sorted(robustness_by_family.items()):
+        print(f"  {fam}: {auc:.4f}")
+    worst = sorted(per_t_auc.items(), key=lambda kv: kv[1])[:3]
     print("  weakest transforms:", ", ".join(f"{n}={a:.3f}" for n, a in worst))
+    print(f"=== Final score (0.5*AUC_clean + 0.5*AUC_robust): {score:.4f} ===")
     print("=== Error analysis ===")
     print(f"  false positives (real->AI): {errors['false_positives']} (mean conf {errors['fp_mean_confidence']})")
     print(f"  false negatives (AI->real): {errors['false_negatives']} (mean conf {errors['fn_mean_confidence']})")

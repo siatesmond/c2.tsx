@@ -68,7 +68,7 @@ class TrainConfig:
     # Stop training after this many epochs without improvement on `monitor`.
     early_stopping_patience: int = 8
     # Validation metric used to pick the best model and for early stopping.
-    monitor: str = "f1"
+    monitor: str = "roc_auc"
     # Decision threshold for converting probabilities to class predictions.
     threshold: float = 0.5
     # Master on/off switch for training-time augmentation. The actual mix of
@@ -81,6 +81,8 @@ class TrainConfig:
     device: str = "auto"
     # Use automatic mixed precision (only effective on cuda).
     amp: bool = True
+    # Run the heavier robustness evaluation every N epochs (1 = every epoch).
+    robust_eval_every: int = 1
 
 
 @dataclass

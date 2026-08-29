@@ -1,6 +1,7 @@
 # Standard library imports
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -9,17 +10,21 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import (CosineAnnealingWarmRestarts,
                                        ReduceLROnPlateau, StepLR)
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm  # progress bar helper
 
 # Project-local modules
-from config import (BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, TRAIN_CFG,
+from config import (BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, TRAIN_CFG, ROBUSTNESS_CFG,
                     MODEL_CFG, TrainConfig, weights_path)
 from datasets import RealAIDataset  # custom dataset that loads real vs AI images
-from metrics import classification_metrics  # computes F1/accuracy/precision/recall
+from metrics import (classification_metrics, robustness_score, final_score,
+                     optimal_threshold)
+from augmentations import get_robustness_transforms
+from evaluate import predict_probs, error_analysis
 from model import build_model  # factory that constructs the detector network
 
 
@@ -122,29 +127,95 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler, use_amp):
 
 
 @torch.no_grad()
-def validation_confidence(model, loader, device, threshold):
+def validation_confidence(model, loader, device):
     # Like evaluate_loader, but also tracks the model's average confidence on
     # correct vs. incorrect predictions (a useful calibration signal).
+    # The ROC-AUC is threshold-independent and stays the headline metric; the
+    # hard metrics (accuracy/F1/...) are computed at the ROC-optimal threshold.
     model.eval()
-    y_true, y_prob, correct_conf, wrong_conf = [], [], [], []
+    y_true, y_prob = [], []
     for x, y in loader:
         x = x.to(device)
         prob = torch.sigmoid(model(x)).squeeze(-1).cpu().numpy()
-        yt = y.numpy().astype(int)
-        pred = (prob >= threshold).astype(int)  # threshold the probability into a class
-        for t, p, pr in zip(yt, pred, prob):
-            if p == t:
-                correct_conf.append(pr)  # store confidence for correct predictions
-            else:
-                wrong_conf.append(pr)  # store confidence for wrong predictions
-        y_true.extend(yt.tolist())
+        y_true.extend(y.numpy().astype(int).tolist())
         y_prob.extend(prob.tolist())
-    metrics, _ = classification_metrics(y_true, y_prob, threshold)
-    # Extra diagnostic fields describing how confident the model generally is.
+    # Choose the ROC-optimal decision threshold (Youden's J); ROC-AUC is the
+    # headline metric and stays threshold-independent. All hard metrics and the
+    # confidence breakdown below use this operating point.
+    best_thr = optimal_threshold(y_true, y_prob)
+    metrics, y_pred = classification_metrics(y_true, y_prob, best_thr)
+    correct_conf, wrong_conf = [], []
+    for t, p, pr in zip(y_true, y_pred, y_prob):
+        (correct_conf if p == t else wrong_conf).append(pr)
+    metrics["threshold"] = best_thr  # record the operating point that was used
     metrics["confidence_score"] = float(np.mean(y_prob))  # average predicted probability
     metrics["mean_conf_correct"] = float(np.mean(correct_conf)) if correct_conf else float("nan")
     metrics["mean_conf_wrong"] = float(np.mean(wrong_conf)) if wrong_conf else float("nan")
-    return metrics
+    return metrics, y_true, y_prob
+
+
+class _ValSampleDataset(Dataset):
+    # Wraps the validation samples so they can be fed through a custom transform
+    # (used for the per-epoch robustness evaluation on the val split).
+    def __init__(self, samples, transform):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        p, label, _cls = self.samples[idx]
+        img = Image.open(p).convert("RGB")
+        return self.transform(img), label, str(p)
+
+
+class _TransformedView(Dataset):
+    # Applies a single robustness transform (on top of the base pipeline) to each
+    # validation image, mirroring evaluate.py's robustness evaluation.
+    def __init__(self, samples, fn, base_tf):
+        self.samples = samples
+        self.fn = fn
+        self.base_tf = base_tf
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        p, label, _cls = self.samples[idx]
+        img = Image.open(p).convert("RGB")
+        img = self.fn(img)
+        return self.base_tf(img), label, str(p)
+
+
+@torch.no_grad()
+def evaluate_val_robustness(model, val_ds, device, batch_size, severity):
+    # Compute ROC-AUC for each robustness transform on the validation set.
+    base_tf = val_ds.transform
+    rob = get_robustness_transforms(severity)
+    per_transform_auc = {}
+    for name, (category, fn) in rob.items():
+        loader = DataLoader(_TransformedView(val_ds.samples, fn, base_tf),
+                            batch_size=batch_size, shuffle=False, num_workers=0)
+        probs, labels, _ = predict_probs(model, loader, device)
+        m, _ = classification_metrics(labels, probs, 0.5)
+        per_transform_auc[name] = m["roc_auc"]
+    return per_transform_auc
+
+
+def ask_continue(epoch, num_epochs):
+    # Interactive early-stop check. Only prompts when stdin is a real terminal,
+    # so piped/non-interactive runs keep going automatically.
+    if not sys.stdin.isatty():
+        return True
+    try:
+        ans = input(f"\nEpoch {epoch}/{num_epochs}: continue training? "
+                    f"[Enter/Y = yes, n = stop now, b = stop & keep best] ").strip().lower()
+    except EOFError:
+        return True
+    if ans in ("n", "no", "b"):
+        return False
+    return True
 
 
 def main(cfg=TRAIN_CFG):
@@ -188,13 +259,32 @@ def main(cfg=TRAIN_CFG):
     for epoch in range(1, cfg.num_epochs + 1):
         loss = train_epoch(model, train_dl, optimizer, criterion, device, scaler, cfg.amp)
         if val_dl is not None:
-            # Evaluate on the validation set using the configured threshold.
-            val_metrics = validation_confidence(model, val_dl, device, cfg.threshold)
+            # Evaluate on the validation set. ROC-AUC is threshold-independent and
+            # is the primary metric; hard metrics use the ROC-optimal threshold.
+            val_metrics, y_true, y_prob = validation_confidence(model, val_dl, device)
             # The metric we track for "best model" / scheduling decisions.
             monitor_val = val_metrics.get(cfg.monitor, -float("inf"))
             print(f"Epoch {epoch:02d}/{cfg.num_epochs} | loss {loss:.4f} | "
-                  f"val_f1 {val_metrics['f1']:.4f} | val_acc {val_metrics['accuracy']:.4f} | "
+                  f"val_roc_auc {val_metrics['roc_auc']:.4f} | val_acc {val_metrics['accuracy']:.4f} | "
+                  f"thr {val_metrics['threshold']:.3f} | "
                   f"conf {val_metrics['confidence_score']:.4f} | lr {optimizer.param_groups[0]['lr']:.2e}")
+
+            # --- Per-epoch diagnostics: error analysis + robustness + final score ---
+            err = error_analysis(np.array(y_prob), np.array(y_true), None, val_metrics["threshold"])
+            print(f"  errors: FP(real->AI)={err['false_positives']} "
+                  f"(conf {err['fp_mean_confidence']}) | "
+                  f"FN(AI->real)={err['false_negatives']} (conf {err['fn_mean_confidence']})")
+            print(f"  -> {err['interpretation']}")
+
+            if (epoch % cfg.robust_eval_every) == 0:
+                per_t_auc = evaluate_val_robustness(model, val_dl.dataset, device,
+                                                    cfg.batch_size, ROBUSTNESS_CFG.severity)
+                rob = robustness_score(per_t_auc, ROBUSTNESS_CFG.weight_by_severity)
+                score = final_score(val_metrics["roc_auc"], rob["robustness_score"])
+                worst = sorted(per_t_auc.items(), key=lambda kv: kv[1])[:3]
+                print(f"  robustness AUC: {rob['robustness_score']:.4f} | "
+                      f"final score (0.5*AUC_clean+0.5*AUC_robust): {score:.4f}")
+                print(f"  weakest transforms: " + ", ".join(f"{n}={a:.3f}" for n, a in worst))
         else:
             # No validation set: treat negative training loss as the monitor signal.
             monitor_val = -loss
@@ -234,6 +324,12 @@ def main(cfg=TRAIN_CFG):
                 print(f"Early stopping: no improvement for {epochs_no_improve} epochs.")
                 break
 
+        # --- Interactive early stop ------------------------------------------
+        # After each epoch, let the user stop once results look acceptable.
+        if not ask_continue(epoch, cfg.num_epochs):
+            print("Stopping early by user request; best weights are kept.")
+            break
+
     # --- Teardown -----------------------------------------------------------
     # Write the full training history to a JSON file next to the weights.
     with open(weights_out.with_suffix(".history.json"), "w") as f:
@@ -254,6 +350,10 @@ def parse_args():
     ap.add_argument("--device", type=str, default=TRAIN_CFG.device)
     ap.add_argument("--num_workers", type=int, default=TRAIN_CFG.num_workers)
     ap.add_argument("--seed", type=int, default=TRAIN_CFG.seed)
+    ap.add_argument("--robust_eval_every", type=int, default=TRAIN_CFG.robust_eval_every,
+                    help="Run the robustness eval every N epochs (1 = every epoch).")
+    ap.add_argument("--no_prompt", action="store_true",
+                    help="Disable the interactive continue/stop prompt after each epoch.")
     ap.add_argument("--model", type=str, default=MODEL_CFG.name,
                     help="TorchVision EfficientNet variant, e.g. efficientnet_b0/b1/b2. "
                          "Each variant is saved to its own checkpoint file.")
@@ -271,6 +371,9 @@ if __name__ == "__main__":
         num_epochs=a.epochs, batch_size=a.batch_size, learning_rate=a.lr,
         augment_level=a.augment_level, scheduler=a.scheduler, monitor=a.monitor,
         early_stopping_patience=a.patience, device=a.device, seed=a.seed,
-        num_workers=a.num_workers,
+        num_workers=a.num_workers, robust_eval_every=a.robust_eval_every,
     )
+    if a.no_prompt:
+        # Force non-interactive mode by detaching stdin from a tty.
+        sys.stdin = open(os.devnull, "r")
     main(cfg)
