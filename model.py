@@ -55,7 +55,7 @@ def build_model(cfg=MODEL_CFG, device=None):
 def load_best_weights(model, path, device=None):
     # Load weights from a checkpoint produced by train.py.
     # Accepts either the full dict (with "model_state") or a raw state_dict.
-    state = torch.load(path, map_location=device or "cpu")
+    state = torch.load(path, map_location=device or "cpu", weights_only=False)
     if isinstance(state, dict) and "model_state" in state:
         model.load_state_dict(state["model_state"])
     else:

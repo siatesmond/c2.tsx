@@ -20,7 +20,7 @@ from PIL import Image, ImageFile
 from torchvision import transforms
 from tqdm import tqdm
 
-from config import BEST_WEIGHTS, MODEL_CFG
+from config import BEST_WEIGHTS, MODEL_CFG, ModelConfig, weights_path
 from model import build_model, load_best_weights
 from metrics import classification_metrics, optimal_threshold
 from evaluate import error_analysis
@@ -59,6 +59,8 @@ def main():
     ap = argparse.ArgumentParser(description="Test best model on real-world real/ai folders.")
     ap.add_argument("--root", default=".", help="Folder containing real/ and ai/ subfolders")
     ap.add_argument("--weights", default=str(BEST_WEIGHTS), help="Path to best_model.pth")
+    ap.add_argument("--model", default=MODEL_CFG.name,
+                    help="TorchVision EfficientNet variant (e.g. efficientnet_b2)")
     ap.add_argument("--threshold", type=float, default=0.5, help="Decision boundary")
     ap.add_argument("--batch_size", type=int, default=64, help="Images per forward pass")
     ap.add_argument("--max_per_class", type=int, default=None,
@@ -67,9 +69,16 @@ def main():
     ap.add_argument("--output", default="realworld_eval.json", help="Report output path")
     a = ap.parse_args()
 
+    # If no explicit weights path was given, fall back to the variant-specific
+    # checkpoint (models/best_model_<model>.pth) instead of the b0 default.
+    if a.weights == str(BEST_WEIGHTS):
+        a.weights = str(weights_path(a.model))
+
     device = resolve_device(a.device)
-    print(f"Device: {device} | model: {MODEL_CFG.name}")
-    model = build_model(MODEL_CFG, device)
+    model_cfg = ModelConfig(name=a.model, pretrained=MODEL_CFG.pretrained,
+                            num_classes=MODEL_CFG.num_classes, dropout=MODEL_CFG.dropout)
+    print(f"Device: {device} | model: {model_cfg.name}")
+    model = build_model(model_cfg, device)
     print(f"Loading weights from {a.weights} ...")
     load_best_weights(model, a.weights, device)  # populates models/best_model.pth
     print("Model ready.")
