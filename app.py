@@ -1,15 +1,24 @@
 """Flask web application for the real-vs-AI image detector.
 
 Provides:
-  GET  /            -> serves the frontend UI
-  POST /predict     -> accepts one or more uploaded images, runs inference,
-                       returns JSON with per-image statistics
+  GET  /                  -> serves the frontend UI
+  POST /predict           -> scores ONE chunk of uploaded images and returns
+                             per-image statistics
+  POST /aggregate         -> folder-level metrics over every chunk of a run
+  GET  /eval-report       -> the offline eval_report.json from evaluate.py
+  GET  /eval-report/exists
+
+A folder of any size is supported because the frontend slices the selection
+into chunks and posts them one at a time; /predict is stateless per chunk and
+/aggregate stitches the run back together at the end.
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import json
+import math
 import os
 import sys
 import time
@@ -17,6 +26,7 @@ import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -40,7 +50,25 @@ from metrics import classification_metrics, optimal_threshold
 # App setup
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB upload limit
+
+# ---------------------------------------------------------------------------
+# Upload sizing
+#
+# The frontend never posts a whole folder in one request: it slices the
+# selection into small chunks and posts them one after another (see
+# CHUNK_FILES / CHUNK_BYTES in templates/index.html). That is what makes an
+# arbitrarily large folder work -- total upload size is unbounded, only the
+# size of a single chunk matters here.
+#
+# MAX_UPLOAD_MB therefore caps ONE chunk, not the job. Set it to 0 (the
+# default) to disable the per-request cap entirely.
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "0"))
+app.config["MAX_CONTENT_LENGTH"] = (MAX_UPLOAD_MB * 1024 * 1024) or None
+
+# How many images are stacked into a single forward pass. Larger = faster on
+# GPU, more memory. Overridable for low-RAM machines.
+BATCH_SIZE = max(1, int(os.environ.get("PREDICT_BATCH_SIZE", "16")))
 
 # ---------------------------------------------------------------------------
 # Error handlers – always return JSON so the frontend can parse the response
@@ -48,7 +76,11 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB upload limit
 # ---------------------------------------------------------------------------
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify({"error": "Upload too large. Maximum total size is 500 MB."}), 413
+    return jsonify({"error": (
+        f"Upload chunk too large (limit {MAX_UPLOAD_MB} MB per request). "
+        "Lower CHUNK_BYTES in the frontend, or raise/disable the cap with "
+        "the MAX_UPLOAD_MB environment variable."
+    )}), 413
 
 @app.errorhandler(500)
 def server_error(e):
@@ -56,9 +88,116 @@ def server_error(e):
 
 @app.errorhandler(Exception)
 def unhandled(e):
+    # Let real HTTP errors (404, 405, ...) keep their own status code; only
+    # genuine crashes should be reported as 500.
+    if isinstance(e, HTTPException):
+        return jsonify({"error": e.description}), e.code
     return jsonify({"error": str(e)}), 500
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# ---------------------------------------------------------------------------
+# Checkpoint discovery
+#
+# This repo contains TWO independently-trained stacks that save incompatible
+# checkpoints, so the app must pick the right one rather than the first one
+# that happens to exist:
+#
+#   * root stack   (train.py + model.py, torchvision EfficientNet)
+#       -> keys look like "backbone.features.0.0.weight"
+#       -> THIS is what app.py / model.py can load
+#   * src/ stack   (src/train.py + src/model.py, timm EfficientNet)
+#       -> keys look like "conv_stem.weight", "blocks.0.0..."
+#       -> loading it into the torchvision model raises a key-mismatch error
+#
+# Candidates are tried in order; any checkpoint in the timm layout is skipped
+# with an explanatory message instead of blowing up mid-request.
+# ---------------------------------------------------------------------------
+WEIGHT_CANDIDATES = [
+    Path(BEST_WEIGHTS),                                    # models/best_model_<variant>.pth
+    PROJECT_ROOT / "best_model.pth",                       # committed root-stack checkpoint
+    PROJECT_ROOT / "outputs" / "checkpoints" / "best.pt",  # src/ stack (timm) - usually rejected
+]
+
+
+def _state_dict_of(path):
+    """Return the raw parameter dict from a checkpoint, whatever wrapper it uses."""
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(obj, dict) and "model_state" in obj:
+        return obj["model_state"]
+    return obj
+
+
+def is_torchvision_checkpoint(path) -> bool:
+    """True if the checkpoint matches model.EfficientNetDetector's parameter names."""
+    try:
+        keys = list(_state_dict_of(path).keys())
+    except Exception:
+        return False
+    return any(k.startswith("backbone.features.") for k in keys)
+
+
+def resolve_weights() -> Path:
+    """First candidate that exists AND is loadable by the torchvision model."""
+    seen = []
+    for path in WEIGHT_CANDIDATES:
+        if not path.exists():
+            continue
+        seen.append(path)
+        if is_torchvision_checkpoint(path):
+            return path
+        print(f"[app] skipping {path}: not a torchvision-format checkpoint "
+              f"(looks like a timm checkpoint from src/train.py)")
+
+    raise FileNotFoundError(
+        "No compatible checkpoint found. app.py serves the root stack "
+        "(train.py + model.py, torchvision EfficientNet). "
+        f"Looked in {[str(p) for p in WEIGHT_CANDIDATES]}; "
+        f"existing but incompatible: {[str(p) for p in seen]}. "
+        "Train one with 'python train.py', or point BEST_WEIGHTS at a "
+        "checkpoint whose keys start with 'backbone.features.'."
+    )
+
+# ---------------------------------------------------------------------------
+# Decision threshold
+#
+# 0.5 is the right default only for a well-calibrated model. This one is not:
+# on realworld_eval_2k.json (4,000 images) its ROC-AUC is 0.972, but the
+# ROC-optimal cut is 0.0019 and even the most AI-looking REAL images only
+# score ~0.06. The whole probability mass sits near zero, so a 0.5 cutoff
+# labels essentially everything "Real / Human" -- the ranking is good, the
+# calibration is not.
+#
+# So prefer a threshold that was actually fitted to this model's outputs
+# (Youden's J, written by test_realworld.py / evaluate.py) and fall back to
+# the configured constant only when no report exists. THRESHOLD env var
+# overrides everything.
+# ---------------------------------------------------------------------------
+THRESHOLD_REPORTS = [
+    PROJECT_ROOT / "realworld_eval_2k.json",
+    PROJECT_ROOT / "realworld_eval.json",
+]
+
+
+def calibrated_threshold():
+    """Fitted decision threshold, or EVAL_CFG.threshold if none is available."""
+    override = os.environ.get("THRESHOLD")
+    if override:
+        return float(override), "THRESHOLD env var"
+
+    for path in THRESHOLD_REPORTS + _eval_report_candidates():
+        if not path.exists():
+            continue
+        try:
+            with open(path) as f:
+                value = json.load(f).get("threshold")
+        except Exception:
+            continue
+        if isinstance(value, (int, float)) and 0.0 < value < 1.0:
+            return float(value), str(path.relative_to(PROJECT_ROOT))
+
+    return EVAL_CFG.threshold, "config default (uncalibrated)"
+
 
 # ---------------------------------------------------------------------------
 # Model – loaded once at startup and reused for every request
@@ -85,17 +224,13 @@ def get_model():
 
     _model = build_model(MODEL_CFG, _device)
 
-    weights = BEST_WEIGHTS
-    if not Path(weights).exists():
-        # Try the outputs/checkpoints path used by some training runs
-        alt = PROJECT_ROOT / "outputs" / "checkpoints" / "best.pt"
-        if alt.exists():
-            weights = alt
-
+    weights = resolve_weights()
+    print(f"[app] loading weights: {weights}")
     load_best_weights(_model, weights, _device)
     _model.eval()
 
-    _threshold = EVAL_CFG.threshold
+    _threshold, source = calibrated_threshold()
+    print(f"[app] decision threshold: {_threshold:g}  (source: {source})")
     return _model, _device, _threshold
 
 
@@ -117,9 +252,35 @@ def preprocess(pil_image: Image.Image) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def confidence_label(prob_ai: float) -> str:
-    """Map AI probability to a human-readable confidence band."""
-    p = max(prob_ai, 1 - prob_ai)   # distance from 0.5
+def calibrated_score(prob_ai: float, threshold: float) -> float:
+    """Remap the raw score onto a 0-1 scale where the THRESHOLD sits at 0.5.
+
+    The raw score cannot be read as a probability: this model's outputs
+    cluster near zero and the decision boundary is ~0.0019, so a raw 0.28% is
+    genuinely AI while "99.7% real" is just the same number restated against
+    the wrong boundary. Reported side by side with an AI verdict, that reads
+    as a contradiction.
+
+    The remap works in log space because the scores span orders of magnitude
+    (1e-7 to ~0.25); a linear rescale would squash almost every image flat
+    against the boundary. Distance is measured in decades from the threshold,
+    saturating at three -- beyond that the model is as certain as it gets.
+    """
+    eps = 1e-9
+    p = min(max(prob_ai, eps), 1.0 - eps)
+    t = min(max(threshold, eps), 1.0 - eps)
+    decades = math.log10(p / t) / 3.0
+    return 0.5 + 0.5 * max(-1.0, min(1.0, decades))
+
+
+def confidence_label(calibrated: float) -> str:
+    """Confidence band, measured from the DECISION BOUNDARY.
+
+    Takes the calibrated score, not the raw one: measuring from a hardcoded
+    0.5 would call every image "Very High" simply because every raw score
+    sits far below 0.5, including the ones sitting right on the boundary.
+    """
+    p = max(calibrated, 1 - calibrated)
     if p >= 0.90:
         return "Very High"
     if p >= 0.75:
@@ -171,28 +332,43 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/eval-report/exists", methods=["GET"])
-def eval_report_exists():
-    """Lightweight check — returns {exists: true/false} without reading the file."""
-    candidates = [
+# ---------------------------------------------------------------------------
+# eval_report.json discovery
+#
+# evaluate.py writes the report NEXT TO the weights file it was given
+# (Path(weights).with_name("eval_report.json")), so where it lands depends on
+# which checkpoint was evaluated:
+#
+#   python evaluate.py                              -> models/eval_report.json
+#   python evaluate.py --weights best_model.pth     -> eval_report.json (repo root)
+#
+# The repo-root case is the common one here, because the committed checkpoint
+# is best_model.pth at the root rather than under models/. All the locations
+# are searched so the tab finds the report whichever way it was produced.
+# ---------------------------------------------------------------------------
+def _eval_report_candidates():
+    return [
+        # Next to the configured weights file (models/, by default)
         Path(BEST_WEIGHTS).with_name("eval_report.json"),
+        # Next to the committed root-stack checkpoint
+        PROJECT_ROOT / "eval_report.json",
+        # Used by some training runs
         PROJECT_ROOT / "outputs" / "checkpoints" / "eval_report.json",
         PROJECT_ROOT / "models" / "eval_report.json",
     ]
+
+
+@app.route("/eval-report/exists", methods=["GET"])
+def eval_report_exists():
+    """Lightweight check — returns {exists: true/false} without reading the file."""
+    candidates = _eval_report_candidates()
     return jsonify({"exists": any(p.exists() for p in candidates)})
 
 
 @app.route("/eval-report", methods=["GET"])
 def eval_report():
     """Return the eval_report.json produced by evaluate.py, searching known locations."""
-    candidates = [
-        # Primary: next to the configured weights file
-        Path(BEST_WEIGHTS).with_name("eval_report.json"),
-        # Fallback: outputs/checkpoints (used by some training runs)
-        PROJECT_ROOT / "outputs" / "checkpoints" / "eval_report.json",
-        # Any .json named eval_report anywhere under models/
-        PROJECT_ROOT / "models" / "eval_report.json",
-    ]
+    candidates = _eval_report_candidates()
     for path in candidates:
         if path.exists():
             with open(path) as f:
@@ -206,29 +382,114 @@ def eval_report():
     )}), 404
 
 
+# ---------------------------------------------------------------------------
+# Inference core
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def run_batch(model, device, tensors):
+    """One forward pass over a stack of preprocessed images.
+
+    Batching matters at folder scale: a single 16-image forward pass costs far
+    less than 16 one-image passes, which is the difference between a 5k-image
+    folder finishing in minutes rather than tens of minutes.
+    """
+    x = torch.cat(tensors, dim=0).to(device)
+    return torch.sigmoid(model(x)).squeeze(-1).reshape(-1).cpu().tolist()
+
+
+def compute_aggregate(y_true, y_prob, fallback_threshold):
+    """Dataset-level metrics + error analysis, or None when labels are unusable.
+
+    Kept separate from the request handlers because it is needed twice: once
+    for a one-shot /predict call, and once over the *whole* folder after the
+    frontend has streamed every chunk through /predict.
+    """
+    if len(y_true) < 2:
+        return None
+
+    import numpy as np
+
+    # Use the Youden-optimal threshold when enough labels are present,
+    # otherwise fall back to the model's configured threshold.
+    try:
+        best_thr = optimal_threshold(y_true, y_prob)
+    except Exception:
+        best_thr = fallback_threshold
+
+    metrics, y_pred = classification_metrics(y_true, y_prob, best_thr)
+
+    y_true_arr = [int(v) for v in y_true]
+    y_pred_arr = [int(v) for v in y_pred]
+    fp_idx = [i for i, (t, q) in enumerate(zip(y_true_arr, y_pred_arr)) if t == 0 and q == 1]
+    fn_idx = [i for i, (t, q) in enumerate(zip(y_true_arr, y_pred_arr)) if t == 1 and q == 0]
+
+    fp_confs = [y_prob[i] for i in fp_idx]
+    fn_confs = [y_prob[i] for i in fn_idx]
+
+    return {
+        "n":         len(y_true),
+        "threshold": round(float(best_thr), 4),
+        "metrics":   {k: round(v, 4) for k, v in metrics.items()},
+        "error_analysis": {
+            "false_positives":    len(fp_idx),
+            "false_negatives":    len(fn_idx),
+            "fp_mean_confidence": round(float(np.mean(fp_confs)), 4) if fp_confs else None,
+            "fn_mean_confidence": round(float(np.mean(fn_confs)), 4) if fn_confs else None,
+            # Index positions so the caller can point back at the offending rows.
+            "fp_indices":         fp_idx[:50],
+            "fn_indices":         fn_idx[:50],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Routes - prediction
+# ---------------------------------------------------------------------------
 @app.route("/predict", methods=["POST"])
 def predict():
+    """Score one chunk of uploaded images.
+
+    Form fields:
+      images     - the image files (repeated)
+      paths[]    - browser-reported relative path per file, index-aligned with
+                   `images`; used to infer the ground-truth label from folder
+                   names such as .../real/ or .../ai/
+      thumbs     - "0" to skip base-64 previews. The frontend turns these off
+                   past the first few hundred images so a 10k-image folder does
+                   not build a multi-hundred-MB JSON response.
+      aggregate  - "0" to skip per-chunk metrics. Chunked runs pass 0 and call
+                   /aggregate once at the end instead, because metrics over a
+                   16-image slice say nothing about the folder.
+    """
     files = request.files.getlist("images")
     if not files or all(f.filename == "" for f in files):
         return jsonify({"error": "No images uploaded."}), 400
 
-    # Relative paths sent by the browser (webkitRelativePath or bare filename).
-    # Index-aligned with the 'images' list so we can infer labels per file.
-    rel_paths = request.form.getlist("paths[]")
+    rel_paths      = request.form.getlist("paths[]")
+    want_thumbs    = request.form.get("thumbs", "1") != "0"
+    want_aggregate = request.form.get("aggregate", "1") != "0"
 
     model, device, threshold = get_model()
-    results = []
 
+    results = []   # rows in upload order
+    pending = []   # (index into `results`, preprocessed tensor) awaiting a pass
+
+    # --- Pass 1: decode + preprocess -------------------------------------
     for idx, f in enumerate(files):
         if not f or f.filename == "":
             continue
 
+        # Prefer the browser-reported relative path: inside a folder upload it
+        # is the only thing that distinguishes real/cat.jpg from ai/cat.jpg.
+        rel_path = rel_paths[idx] if idx < len(rel_paths) else f.filename
+
         ext = Path(f.filename).suffix.lower()
         if ext not in ALLOWED_EXTENSIONS:
             results.append({
-                "id": str(uuid.uuid4())[:8],
-                "filename": f.filename,
-                "error": f"Unsupported file type '{ext}'.",
+                "id":         str(uuid.uuid4())[:8],
+                "filename":   f.filename,
+                "image_path": rel_path,
+                "error":      f"Unsupported file type '{ext}'.",
             })
             continue
 
@@ -236,95 +497,102 @@ def predict():
             raw_bytes = f.read()
             img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
             width, height = img.size
-            file_size_kb = round(len(raw_bytes) / 1024, 1)
-
-            # Infer ground-truth label from the browser-reported relative path
-            # (populated when the user picks a folder via webkitdirectory).
-            rel_path = rel_paths[idx] if idx < len(rel_paths) else f.filename
-            true_label = infer_label(rel_path)
-
-            # --- Inference ---
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                x = preprocess(img).to(device)
-                prob_ai = float(torch.sigmoid(model(x)).squeeze(-1).cpu().item())
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-
-            prob_real  = round(1.0 - prob_ai, 4)
-            prob_ai_r  = round(prob_ai, 4)
-            pred_label = 1 if prob_ai >= threshold else 0
 
             row = {
                 "id":             str(uuid.uuid4())[:8].upper(),
                 "filename":       f.filename,
-                "thumbnail":      pil_to_data_uri(img),
-                "prob_ai":        prob_ai_r,
-                "prob_real":      prob_real,
-                "verdict":        verdict(prob_ai, threshold),
-                "confidence":     confidence_label(prob_ai),
-                "pred_label":     pred_label,
-                "true_label":     true_label,   # 0, 1, or null
+                # Deliverable field (Section 5.5): the JSON export pairs
+                # image_path with pred straight out of these rows.
+                "image_path":     rel_path,
+                "true_label":     infer_label(rel_path),   # 0, 1, or None
                 "width":          width,
                 "height":         height,
-                "file_size_kb":   file_size_kb,
-                "inference_ms":   elapsed_ms,
+                "file_size_kb":   round(len(raw_bytes) / 1024, 1),
                 "threshold_used": threshold,
             }
-            # Correctness only meaningful when ground truth is known
-            if true_label is not None:
-                row["correct"] = (pred_label == true_label)
+            # Build the thumbnail now, while the decoded image is still around,
+            # so the full-resolution copy can be released immediately after.
+            if want_thumbs:
+                row["thumbnail"] = pil_to_data_uri(img)
 
+            pending.append((len(results), preprocess(img)))
             results.append(row)
+            del img
 
         except Exception as exc:
             results.append({
-                "id":       str(uuid.uuid4())[:8],
-                "filename": f.filename,
-                "error":    str(exc),
+                "id":         str(uuid.uuid4())[:8],
+                "filename":   f.filename,
+                "image_path": rel_path,
+                "error":      str(exc),
             })
 
-    # ------------------------------------------------------------------
-    # Aggregate metrics – computed only when at least one label is known
-    # ------------------------------------------------------------------
-    ok = [r for r in results if "error" not in r]
-    labeled = [(r["true_label"], r["prob_ai"]) for r in ok if r["true_label"] is not None]
+    # --- Pass 2: batched forward passes ----------------------------------
+    for start in range(0, len(pending), BATCH_SIZE):
+        batch = pending[start:start + BATCH_SIZE]
 
+        t0 = time.perf_counter()
+        probs = run_batch(model, device, [t for _, t in batch])
+        # Batched inference has no meaningful per-image timing; report the
+        # batch's per-image share so the column stays comparable.
+        per_image_ms = round((time.perf_counter() - t0) * 1000 / len(batch), 1)
+
+        for (row_idx, _), prob_ai in zip(batch, probs):
+            prob_ai = float(prob_ai)
+            row = results[row_idx]
+            # 6dp, not 4: this model's AI scores cluster near zero, and
+            # rounding to 4dp flattens a real 0.0003 into a meaningless 0.0.
+            cal = calibrated_score(prob_ai, threshold)
+            row["prob_ai"]      = round(prob_ai, 6)
+            row["prob_real"]    = round(1.0 - prob_ai, 6)
+            # Threshold-relative view of the same score, so the number shown
+            # next to the verdict agrees with it.
+            row["calibrated_ai"] = round(cal, 4)
+            row["verdict"]      = verdict(prob_ai, threshold)
+            row["confidence"]   = confidence_label(cal)
+            row["pred_label"]   = 1 if prob_ai >= threshold else 0
+            row["inference_ms"] = per_image_ms
+            # Correctness only means anything when ground truth is known.
+            if row["true_label"] is not None:
+                row["correct"] = (row["pred_label"] == row["true_label"])
+
+    # --- Optional per-chunk metrics --------------------------------------
     aggregate = None
-    if len(labeled) >= 2:
-        import numpy as np
-        y_true = [l for l, _ in labeled]
-        y_prob = [p for _, p in labeled]
-
-        # Use the Youden-optimal threshold when enough labels are present,
-        # otherwise fall back to the model's configured threshold.
-        try:
-            best_thr = optimal_threshold(y_true, y_prob)
-        except Exception:
-            best_thr = threshold
-
-        metrics, y_pred = classification_metrics(y_true, y_prob, best_thr)
-
-        y_true_arr = [int(v) for v in y_true]
-        y_pred_arr = [int(v) for v in y_pred]
-        fp = sum(1 for t, p in zip(y_true_arr, y_pred_arr) if t == 0 and p == 1)
-        fn = sum(1 for t, p in zip(y_true_arr, y_pred_arr) if t == 1 and p == 0)
-
-        fp_confs = [y_prob[i] for i, (t, p) in enumerate(zip(y_true_arr, y_pred_arr)) if t == 0 and p == 1]
-        fn_confs = [y_prob[i] for i, (t, p) in enumerate(zip(y_true_arr, y_pred_arr)) if t == 1 and p == 0]
-
-        aggregate = {
-            "n":         len(labeled),
-            "threshold": round(best_thr, 4),
-            "metrics":   {k: round(v, 4) for k, v in metrics.items()},
-            "error_analysis": {
-                "false_positives":    fp,
-                "false_negatives":    fn,
-                "fp_mean_confidence": round(float(np.mean(fp_confs)), 4) if fp_confs else None,
-                "fn_mean_confidence": round(float(np.mean(fn_confs)), 4) if fn_confs else None,
-            },
-        }
+    if want_aggregate:
+        labeled = [(r["true_label"], r["prob_ai"]) for r in results
+                   if "error" not in r and r["true_label"] is not None]
+        aggregate = compute_aggregate([l for l, _ in labeled],
+                                      [p for _, p in labeled],
+                                      threshold)
 
     return jsonify({"results": results, "aggregate": aggregate})
+
+
+@app.route("/aggregate", methods=["POST"])
+def aggregate_route():
+    """Score the WHOLE job once every chunk has been predicted.
+
+    The frontend posts back just the (true_label, prob_ai) pairs it collected
+    across all chunks - a few bytes per image - so folder-level accuracy, F1,
+    ROC-AUC and the error counts are computed over the entire upload rather
+    than over whichever 16 images happened to share a request.
+
+    Body: {"items": [{"true_label": 0|1, "prob_ai": 0.97}, ...]}
+    """
+    payload = request.get_json(silent=True) or {}
+    items = payload.get("items") or []
+
+    y_true, y_prob = [], []
+    for it in items:
+        label = it.get("true_label")
+        prob = it.get("prob_ai")
+        if label is None or prob is None:
+            continue
+        y_true.append(int(label))
+        y_prob.append(float(prob))
+
+    _, _, threshold = get_model()
+    return jsonify({"aggregate": compute_aggregate(y_true, y_prob, threshold)})
 
 
 # ---------------------------------------------------------------------------
@@ -333,5 +601,10 @@ def predict():
 if __name__ == "__main__":
     print("Starting AI Image Detector web interface...")
     print(f"  Model weights : {BEST_WEIGHTS}")
+    print(f"  Batch size    : {BATCH_SIZE}")
+    print(f"  Upload cap    : "
+          f"{str(MAX_UPLOAD_MB) + ' MB per chunk' if MAX_UPLOAD_MB else 'unlimited'}")
     print(f"  Open browser  : http://127.0.0.1:5001")
-    app.run(debug=True, host="0.0.0.0", port=5001)
+    # threaded=False: one model on one device, and the frontend already sends
+    # chunks in a stream - serialising requests avoids concurrent GPU access.
+    app.run(debug=True, host="0.0.0.0", port=5001, threaded=False)
