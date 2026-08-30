@@ -849,3 +849,52 @@ tbody tr.row-wrong:hover   { background: rgba(239,68,68,.10); }
 
 /* Placeholder for a row whose image is not available to preview. */
 .thumb-zoom { font-size: 1.1rem; opacity: .5; }
+
+/* ── Error-analysis example thumbnails ────────────────────────────────────
+   The eval report lists the images the model got wrong. Showing them beats
+   listing paths: the point of error analysis is seeing what fooled it. */
+.example-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: .85rem;
+  padding-left: 0;
+  list-style: none;
+}
+.example-item {
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+  min-width: 0;
+}
+.example-thumb {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  cursor: zoom-in;
+  transition: border-color .12s ease-out, transform .12s ease-out;
+}
+.example-thumb:hover {
+  border-color: var(--accent);
+  transform: scale(1.04);
+}
+/* Placeholder when the report came from another machine and the file is
+   not present here. */
+.example-thumb.missing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 1.4rem;
+  cursor: default;
+}
+.example-thumb.missing:hover { transform: none; border-color: var(--border); }
+.example-path {
+  font-size: .72rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

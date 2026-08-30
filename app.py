@@ -445,6 +445,55 @@ def compute_aggregate(y_true, y_prob, fallback_threshold):
 # ---------------------------------------------------------------------------
 # Routes - prediction
 # ---------------------------------------------------------------------------
+def thumbnail_bytes(img, max_side=320):
+    """JPEG thumbnail bytes for an already-open image."""
+    thumb = img.convert("RGB")
+    thumb.thumbnail((max_side, max_side), Image.LANCZOS)
+    buf = io.BytesIO()
+    thumb.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+@app.route("/eval-image")
+def eval_image():
+    """Serve a thumbnail for a path listed in eval_report.json.
+
+    The report records absolute paths from whichever machine ran evaluate.py,
+    so the Evaluate Report tab needs a way to actually display them. Serving a
+    caller-supplied filesystem path is a path-traversal risk, so the resolved
+    path must sit inside this project directory AND carry an image extension.
+    Anything else is refused rather than read.
+    """
+    raw = request.args.get("path", "")
+    if not raw:
+        return jsonify({"error": "missing path"}), 400
+
+    try:
+        target = Path(raw)
+        if not target.is_absolute():
+            target = PROJECT_ROOT / target
+        # strict=True so a non-existent path fails here rather than later.
+        target = target.resolve(strict=True)
+    except (OSError, ValueError):
+        return jsonify({"error": "not found"}), 404
+
+    if PROJECT_ROOT not in target.parents:
+        return jsonify({"error": "path is outside the project directory"}), 403
+    if target.suffix.lower() not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": "not an image file"}), 403
+
+    try:
+        with Image.open(target) as img:
+            data = thumbnail_bytes(img)
+    except Exception:
+        return jsonify({"error": "unreadable image"}), 404
+
+    response = app.response_class(data, mimetype="image/jpeg")
+    # These files do not change during a session; let the browser keep them.
+    response.headers["Cache-Control"] = "private, max-age=3600"
+    return response
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
     """Score one chunk of uploaded images.

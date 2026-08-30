@@ -253,11 +253,11 @@
       <div id="r-interpretation" class="interpretation-box"></div>
 
       <div class="examples-row">
-        <details class="example-details" id="r-fp-examples-wrap">
+        <details class="example-details" id="r-fp-examples-wrap" open>
           <summary>False positive examples <span id="r-fp-ex-count"></span></summary>
           <ul class="example-list" id="r-fp-examples"></ul>
         </details>
-        <details class="example-details" id="r-fn-examples-wrap">
+        <details class="example-details" id="r-fn-examples-wrap" open>
           <summary>False negative examples <span id="r-fn-ex-count"></span></summary>
           <ul class="example-list" id="r-fn-examples"></ul>
         </details>
@@ -859,11 +859,47 @@
     const ct = document.getElementById(countId);
     el.innerHTML = '';
     ct.textContent = paths.length ? `(${paths.length})` : '(none)';
+
     paths.forEach(p => {
       const li = document.createElement('li');
-      li.textContent = p;
+      li.className = 'example-item';
+
+      // The report stores absolute paths; /eval-image serves a thumbnail for
+      // any of them that resolves inside the project directory.
+      const img = document.createElement('img');
+      img.className = 'example-thumb';
+      img.loading = 'lazy';
+      img.alt = '';
+      img.src = '/eval-image?path=' + encodeURIComponent(p);
+      // A report generated on another machine points at paths that do not
+      // exist here; show a marker rather than a broken-image icon.
+      img.addEventListener('error', () => {
+        const ph = document.createElement('span');
+        ph.className = 'example-thumb missing';
+        ph.textContent = '?';
+        ph.title = 'Image not found on this machine';
+        img.replaceWith(ph);
+      });
+      img.addEventListener('click', () => showLightbox(img.src, `
+        <div class="lb-path">${escHtml(p)}</div>
+        <div class="lb-facts"><span>${escHtml(listId.includes('fp')
+          ? 'False positive - a REAL image the model called AI'
+          : 'False negative - an AI image the model called real')}</span></div>`));
+
+      const label = document.createElement('span');
+      label.className = 'example-path';
+      label.title = p;
+      label.textContent = shortPath(p);
+
+      li.append(img, label);
       el.appendChild(li);
     });
+  }
+
+  // Reports carry full absolute paths, which are too long to read in a list.
+  function shortPath(p) {
+    const parts = String(p).split(/[\\/]/).filter(Boolean);
+    return parts.slice(-2).join('/');
   }
 
   // ── Lightbox ───────────────────────────────────────────────────────────
@@ -881,6 +917,24 @@
     const cell = e.target.closest('.thumb-cell[data-row]');
     if (cell) { e.preventDefault(); openLightbox(Number(cell.dataset.row)); }
   });
+
+  // Shared by the results table and the eval-report example lists.
+  function showLightbox(src, captionHtml) {
+    lightboxImg.style.width = '';
+    lightboxImg.onload = () => {
+      const vw = window.innerWidth  || document.documentElement.clientWidth;
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      if (!vw || !vh) return;
+      const scale = Math.min(2, (vw * 0.9) / lightboxImg.naturalWidth,
+                                (vh * 0.7) / lightboxImg.naturalHeight);
+      if (scale > 0) lightboxImg.style.width = (lightboxImg.naturalWidth * scale) + 'px';
+    };
+    lightboxImg.src = src;
+    document.getElementById('lightbox-caption').innerHTML = captionHtml;
+    lightbox.style.display = '';
+    document.body.style.overflow = 'hidden';
+    document.getElementById('lightbox-close').focus();
+  }
 
   function openLightbox(idx) {
     const r = _allRows[idx];
