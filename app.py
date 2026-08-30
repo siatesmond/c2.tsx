@@ -18,7 +18,6 @@ from __future__ import annotations
 import base64
 import io
 import json
-import math
 import os
 import sys
 import time
@@ -41,6 +40,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import torch
 from torchvision import transforms
+
+from dataclasses import replace
 
 from config import BEST_WEIGHTS, EVAL_CFG, MODEL_CFG
 from model import build_model, load_best_weights
@@ -113,11 +114,28 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # Candidates are tried in order; any checkpoint in the timm layout is skipped
 # with an explanatory message instead of blowing up mid-request.
 # ---------------------------------------------------------------------------
-WEIGHT_CANDIDATES = [
-    Path(BEST_WEIGHTS),                                    # models/best_model_<variant>.pth
-    PROJECT_ROOT / "best_model.pth",                       # committed root-stack checkpoint
-    PROJECT_ROOT / "outputs" / "checkpoints" / "best.pt",  # src/ stack (timm) - usually rejected
-]
+def _weight_candidates():
+    """Checkpoints to try, best first. WEIGHTS env var overrides everything."""
+    override = os.environ.get("WEIGHTS")
+    if override:
+        return [Path(override)]
+    return [
+        Path(BEST_WEIGHTS),                                    # models/best_model_<variant>.pth
+        # Root-level variant checkpoints, newest architecture first. A run of
+        # `train.py --model efficientnet_b1` writes this name, and it will not
+        # load into a b0, so the variant has to be read from the file rather
+        # than assumed from config.
+        PROJECT_ROOT / "best_model_efficientnet_b2.pth",
+        PROJECT_ROOT / "best_model_efficientnet_b1.pth",
+        PROJECT_ROOT / "best_model.pth",                       # original b0
+        PROJECT_ROOT / "outputs" / "checkpoints" / "best.pt",  # src/ stack (timm) - rejected
+    ]
+
+
+# NOTE: deliberately not evaluated at import time. The WEIGHTS override can
+# be set after this module is imported (by __main__, or by a test), and a
+# frozen list would silently ignore it.
+WEIGHT_CANDIDATES = _weight_candidates()   # import-time snapshot, for reference only
 
 
 def _state_dict_of(path):
@@ -140,7 +158,9 @@ def is_torchvision_checkpoint(path) -> bool:
 def resolve_weights() -> Path:
     """First candidate that exists AND is loadable by the torchvision model."""
     seen = []
-    for path in WEIGHT_CANDIDATES:
+    # Re-read rather than using the import-time snapshot, so a WEIGHTS
+    # override set later still takes effect.
+    for path in _weight_candidates():
         if not path.exists():
             continue
         seen.append(path)
@@ -157,6 +177,33 @@ def resolve_weights() -> Path:
         "Train one with 'python train.py', or point BEST_WEIGHTS at a "
         "checkpoint whose keys start with 'backbone.features.'."
     )
+
+def checkpoint_meta(path):
+    """What a checkpoint says about itself: (model_name, image_size, threshold).
+
+    train.py records these alongside the weights, which matters because they
+    are NOT interchangeable between runs: efficientnet_b1 weights will not
+    load into a b0, and a model trained at 240px scored at 224px quietly
+    loses accuracy with no error to notice. Any field the checkpoint does not
+    carry comes back None and the caller falls back to config.
+    """
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None, None, None
+    if not isinstance(obj, dict):
+        return None, None, None
+
+    name = obj.get("model_name")
+    cfg = obj.get("config")
+    size = cfg.get("image_size") if isinstance(cfg, dict) else None
+    metrics = obj.get("metrics")
+    # The threshold train.py fitted on its own validation split. Specific to
+    # this model's output distribution, so it beats any report written for a
+    # different checkpoint.
+    threshold = metrics.get("threshold") if isinstance(metrics, dict) else None
+    return name, size, threshold
+
 
 # ---------------------------------------------------------------------------
 # Decision threshold
@@ -179,11 +226,19 @@ THRESHOLD_REPORTS = [
 ]
 
 
-def calibrated_threshold():
-    """Fitted decision threshold, or EVAL_CFG.threshold if none is available."""
+def calibrated_threshold(from_checkpoint=None, weights_name=None):
+    """Fitted decision threshold, or EVAL_CFG.threshold if none is available.
+
+    Order matters. A threshold fitted to a DIFFERENT checkpoint is worse than
+    useless: the b0 sits at 0.0019 and the b1 at 0.69, so applying one to the
+    other flips essentially every verdict. The checkpoint's own value wins.
+    """
     override = os.environ.get("THRESHOLD")
     if override:
         return float(override), "THRESHOLD env var"
+
+    if from_checkpoint is not None:
+        return float(from_checkpoint), f"threshold recorded in {weights_name}"
 
     for path in THRESHOLD_REPORTS + _eval_report_candidates():
         if not path.exists():
@@ -222,14 +277,30 @@ def get_model():
     else:
         _device = torch.device("cpu")
 
-    _model = build_model(MODEL_CFG, _device)
-
     weights = resolve_weights()
+    name, image_size, ckpt_threshold = checkpoint_meta(weights)
+
+    # Build the architecture the checkpoint was trained as, not the one the
+    # config happens to name -- a mismatch fails loudly here, or worse, the
+    # resolution mismatch fails silently at inference time.
+    cfg = replace(MODEL_CFG, name=name) if name else MODEL_CFG
+    # pretrained=False: load_best_weights replaces every parameter below, so
+    # fetching ImageNet weights first is wasted work -- and on a network with
+    # strict TLS it fails with SSL CERTIFICATE_VERIFY_FAILED before any image
+    # is scored.
+    _model = build_model(replace(cfg, pretrained=False), _device)
+
     print(f"[app] loading weights: {weights}")
+    print(f"[app] architecture   : {cfg.name}" + ("" if name else " (from config - checkpoint did not say)"))
     load_best_weights(_model, weights, _device)
     _model.eval()
 
-    _threshold, source = calibrated_threshold()
+    global _transform
+    _transform = build_transform(image_size or EVAL_CFG.image_size)
+    print(f"[app] input size     : {image_size or EVAL_CFG.image_size}px"
+          + ("" if image_size else " (from config - checkpoint did not say)"))
+
+    _threshold, source = calibrated_threshold(ckpt_threshold, weights.name)
     print(f"[app] decision threshold: {_threshold:g}  (source: {source})")
     return _model, _device, _threshold
 
@@ -237,12 +308,23 @@ def get_model():
 # ---------------------------------------------------------------------------
 # Preprocessing – identical to what training / inference.py use
 # ---------------------------------------------------------------------------
-_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+def build_transform(image_size):
+    """Preprocessing must match what the model was TRAINED with.
+
+    Not a constant any more: efficientnet_b0 was trained at 224 and b1 at
+    240, and scoring at the wrong size costs accuracy without raising
+    anything. get_model() rebuilds this from the checkpoint's own config.
+    """
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+
+# Replaced at model-load time with the size the checkpoint specifies.
+_transform = build_transform(EVAL_CFG.image_size)
 
 
 def preprocess(pil_image: Image.Image) -> torch.Tensor:
@@ -255,22 +337,24 @@ def preprocess(pil_image: Image.Image) -> torch.Tensor:
 def calibrated_score(prob_ai: float, threshold: float) -> float:
     """Remap the raw score onto a 0-1 scale where the THRESHOLD sits at 0.5.
 
-    The raw score cannot be read as a probability: this model's outputs
-    cluster near zero and the decision boundary is ~0.0019, so a raw 0.28% is
-    genuinely AI while "99.7% real" is just the same number restated against
-    the wrong boundary. Reported side by side with an AI verdict, that reads
-    as a contradiction.
+    The raw score cannot be read as a probability when the model is poorly
+    calibrated: efficientnet_b0's outputs cluster near zero with a decision
+    boundary at 0.0019, so a raw 0.28% is genuinely AI while "99.7% real" is
+    the same number restated against the wrong boundary.
 
-    The remap works in log space because the scores span orders of magnitude
-    (1e-7 to ~0.25); a linear rescale would squash almost every image flat
-    against the boundary. Distance is measured in decades from the threshold,
-    saturating at three -- beyond that the model is as certain as it gets.
+    The remap is piecewise-linear between the boundary and each extreme:
+    [0, threshold] -> [0, 0.5] and [threshold, 1] -> [0.5, 1]. It answers
+    "how far from the boundary towards certainty is this?", which holds
+    whatever the threshold is. That matters because thresholds vary hugely
+    between checkpoints -- 0.0019 for the b0, 0.688 for the b1 -- and an
+    earlier log-space version with a fixed span silently collapsed the b1's
+    entire AI range into 50-55%, reporting a raw score of 1.0 as borderline.
     """
-    eps = 1e-9
-    p = min(max(prob_ai, eps), 1.0 - eps)
-    t = min(max(threshold, eps), 1.0 - eps)
-    decades = math.log10(p / t) / 3.0
-    return 0.5 + 0.5 * max(-1.0, min(1.0, decades))
+    t = min(max(threshold, 1e-9), 1.0 - 1e-9)
+    p = min(max(prob_ai, 0.0), 1.0)
+    if p < t:
+        return 0.5 * (p / t)
+    return 0.5 + 0.5 * (p - t) / (1.0 - t)
 
 
 def confidence_label(calibrated: float) -> str:
@@ -452,6 +536,38 @@ def thumbnail_bytes(img, max_side=320):
     buf = io.BytesIO()
     thumb.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
+
+
+@app.route("/model-info")
+def model_info():
+    """What this server is actually serving.
+
+    Worth an endpoint rather than trusting config: BEST_WEIGHTS names a file
+    that may not exist, the checkpoint decides the architecture and input
+    size, and the model loads lazily on the first prediction. So report the
+    live state when it is loaded, and what WOULD load when it is not.
+    """
+    try:
+        weights = resolve_weights()
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+    name, image_size, ckpt_threshold = checkpoint_meta(weights)
+    threshold, source = calibrated_threshold(ckpt_threshold, weights.name)
+
+    return jsonify({
+        "loaded": _model is not None,
+        "weights": str(weights.relative_to(PROJECT_ROOT)
+                       if PROJECT_ROOT in weights.parents else weights),
+        "architecture": name or MODEL_CFG.name,
+        "architecture_source": "checkpoint" if name else "config default",
+        "image_size": image_size or EVAL_CFG.image_size,
+        "image_size_source": "checkpoint" if image_size else "config default",
+        "threshold": threshold,
+        "threshold_source": source,
+        "device": str(_device) if _device else "not yet selected",
+        "batch_size": BATCH_SIZE,
+    })
 
 
 @app.route("/eval-image")
@@ -648,12 +764,40 @@ def aggregate_route():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
+
+    _ap = argparse.ArgumentParser(description="Serve the real-vs-AI detector UI.")
+    _ap.add_argument("--weights", help="Checkpoint to serve (overrides auto-detection)")
+    _ap.add_argument("--threshold", type=float, help="Override the decision threshold")
+    _ap.add_argument("--port", type=int, default=5001)
+    _args = _ap.parse_args()
+
+    # Feed the flags through the same env-var path the rest of the module
+    # already honours, so there is one mechanism rather than two.
+    if _args.weights:
+        os.environ["WEIGHTS"] = _args.weights
+    if _args.threshold is not None:
+        os.environ["THRESHOLD"] = str(_args.threshold)
+
     print("Starting AI Image Detector web interface...")
-    print(f"  Model weights : {BEST_WEIGHTS}")
+    # Resolve for real rather than echoing BEST_WEIGHTS, which names a
+    # per-variant path that often does not exist and is not what gets loaded.
+    try:
+        _w = resolve_weights()
+        _name, _size, _thr = checkpoint_meta(_w)
+        _t, _src = calibrated_threshold(_thr, _w.name)
+        print(f"  Model weights : {_w}")
+        print(f"  Architecture  : {_name or MODEL_CFG.name}"
+              f"{'' if _name else ' (config default)'}")
+        print(f"  Input size    : {_size or EVAL_CFG.image_size}px"
+              f"{'' if _size else ' (config default)'}")
+        print(f"  Threshold     : {_t:g}  ({_src})")
+    except FileNotFoundError as exc:
+        print(f"  Model weights : NONE FOUND - {exc}")
     print(f"  Batch size    : {BATCH_SIZE}")
     print(f"  Upload cap    : "
           f"{str(MAX_UPLOAD_MB) + ' MB per chunk' if MAX_UPLOAD_MB else 'unlimited'}")
-    print(f"  Open browser  : http://127.0.0.1:5001")
+    print(f"  Open browser  : http://127.0.0.1:{_args.port}")
     # threaded=False: one model on one device, and the frontend already sends
     # chunks in a stream - serialising requests avoids concurrent GPU access.
-    app.run(debug=True, host="0.0.0.0", port=5001, threaded=False)
+    app.run(debug=True, host="0.0.0.0", port=_args.port, threaded=False)

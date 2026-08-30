@@ -1,5 +1,6 @@
 # Standard library imports
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -86,7 +87,9 @@ def main():
     args = ap.parse_args()
 
     device = resolve_device(args.device)
-    model = build_model(MODEL_CFG, device)
+    # pretrained=False: load_best_weights replaces every parameter, so the
+    # ImageNet download is wasted and breaks on strict-TLS networks.
+    model = build_model(replace(MODEL_CFG, pretrained=False), device)
     load_best_weights(model, args.weights, device)  # populate model from checkpoint
 
     paths = gather_paths(args.input)

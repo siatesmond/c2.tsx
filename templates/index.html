@@ -12,6 +12,8 @@
   <header>
     <h1>AI Image Detector</h1>
     <p>Upload images to find out if they are AI-generated or real photographs</p>
+    <!-- Which checkpoint is actually loaded. Filled in by /model-info. -->
+    <div id="model-badge" class="model-badge" title="Loading model info..."></div>
   </header>
 
   <!-- Tab bar -->
@@ -302,6 +304,26 @@
   document.getElementById('btn-report').addEventListener('click', () => {
     if (!_reportLoaded) { _reportLoaded = true; loadReport(); }
   });
+
+  // ── Which model is serving this page ───────────────────────────────────
+  (async () => {
+    const badge = document.getElementById('model-badge');
+    try {
+      const resp = await fetch('/model-info');
+      const m = await resp.json();
+      if (!resp.ok) throw new Error(m.error || 'HTTP ' + resp.status);
+      badge.innerHTML = `
+        <span class="mb-item"><b>${escHtml(m.architecture)}</b></span>
+        <span class="mb-item">${m.image_size}px</span>
+        <span class="mb-item">threshold ${Number(m.threshold).toPrecision(3)}</span>
+        <span class="mb-item mb-file" title="${escHtml(m.weights)}">${escHtml(m.weights)}</span>`;
+      badge.title = `architecture from ${m.architecture_source}, `
+                  + `input size from ${m.image_size_source}, `
+                  + `threshold from ${m.threshold_source}`;
+    } catch (err) {
+      badge.innerHTML = `<span class="mb-item mb-error">no model loaded — ${escHtml(err.message)}</span>`;
+    }
+  })();
 
   // ═══════════════════════════════════════════════════════════════════════
   // TAB 1 — ANALYZE

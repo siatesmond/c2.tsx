@@ -898,3 +898,32 @@ tbody tr.row-wrong:hover   { background: rgba(239,68,68,.10); }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── Loaded-model badge ───────────────────────────────────────────────────
+   Which checkpoint is serving this page. The config file cannot answer that
+   -- the checkpoint decides the architecture, input size and threshold. */
+.model-badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: .4rem .75rem;
+  margin-top: .6rem;
+  font-size: .78rem;
+  color: var(--muted);
+}
+.mb-item {
+  padding: .18rem .55rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+}
+.mb-item b { color: var(--accent2); font-weight: 600; }
+.mb-file {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mb-error { color: var(--ai); border-color: var(--ai); }

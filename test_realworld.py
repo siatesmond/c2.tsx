@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+from dataclasses import replace
 import json
 
 import numpy as np
@@ -78,7 +79,8 @@ def main():
     model_cfg = ModelConfig(name=a.model, pretrained=MODEL_CFG.pretrained,
                             num_classes=MODEL_CFG.num_classes, dropout=MODEL_CFG.dropout)
     print(f"Device: {device} | model: {model_cfg.name}")
-    model = build_model(model_cfg, device)
+    # pretrained=False: the checkpoint replaces every parameter anyway.
+    model = build_model(replace(model_cfg, pretrained=False), device)
     print(f"Loading weights from {a.weights} ...")
     load_best_weights(model, a.weights, device)  # populates models/best_model.pth
     print("Model ready.")
