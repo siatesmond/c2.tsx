@@ -68,7 +68,9 @@ class TrainConfig:
     # Stop training after this many epochs without improvement on `monitor`.
     early_stopping_patience: int = 8
     # Validation metric used to pick the best model and for early stopping.
-    monitor: str = "f1"
+    # roc_auc is threshold-independent -- more stable than f1, which swings with
+    # the per-epoch Youden's-J threshold.
+    monitor: str = "roc_auc"
     # Run the (15-transform) validation robustness eval every N epochs. It is a
     # full pass over the val set per transform, so raise this for slow models
     # (e.g. --robust_eval_every 5 for hybrid_clip on MPS/CPU).

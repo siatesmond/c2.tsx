@@ -1,1 +1,11 @@
 data/
+ai/
+real/
+.DS_Store
+.kilo/
+venv/
+.idea/
+FAKE/
+__pycache__/
+*.pyc
+models/

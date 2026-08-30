@@ -1,0 +1,63 @@
+{
+  "threshold": 0.0018815015209838748,
+  "n": 4000,
+  "metrics": {
+    "accuracy": 0.92125,
+    "precision": 0.9358510087946198,
+    "recall": 0.9045,
+    "f1": 0.919908466819222,
+    "roc_auc": 0.97178925,
+    "threshold": 0.0018815015209838748
+  },
+  "error_analysis": {
+    "false_positives": 124,
+    "false_negatives": 191,
+    "fp_mean_confidence": 0.06330148791781656,
+    "fn_mean_confidence": 0.00039209142841096985,
+    "fp_examples": [
+      "real/img158970.jpg",
+      "real/img158980.jpg",
+      "real/img158994.jpg",
+      "real/img159016.jpg",
+      "real/img159036.jpg",
+      "real/img159037.jpg",
+      "real/img159047.jpg",
+      "real/img159075.jpg",
+      "real/img159091.jpg",
+      "real/img159095.jpg",
+      "real/img159143.jpg",
+      "real/img159149.jpg",
+      "real/img159160.jpg",
+      "real/img159164.jpg",
+      "real/img159175.jpg",
+      "real/img159181.jpg",
+      "real/img159184.jpg",
+      "real/img159188.jpg",
+      "real/img159189.jpg",
+      "real/img159212.jpg"
+    ],
+    "fn_examples": [
+      "ai/00d68e44c7523815d6036d92074632cf.jpg",
+      "ai/019fad6885977de39974ff2bf48447fd.jpg",
+      "ai/02db61a11c6e06c8231dcf9dd9db32ab.jpg",
+      "ai/036d7b5c78ff52dd5f5e1f1a1e1550c6.jpg",
+      "ai/044346fed9ecff757d01b51a96aa9e88.jpg",
+      "ai/052e3155100539987e169fe62b67b833.jpg",
+      "ai/063ab7ab56e59a2eb08a9f3772b244ce.jpg",
+      "ai/0669ee35b5523411647881358438e8a6.jpg",
+      "ai/06a9457262f8245037d89bf7df8f8285.jpg",
+      "ai/0819ac54426114b847532ee8cbe102d0.jpg",
+      "ai/086c4a120dbdd103fabbb04199826f15.jpg",
+      "ai/0b5c4f6092c2ff89a3fe55b956071db6.jpg",
+      "ai/0bbcde92a2e23f761973fbc43e0f38a6.jpg",
+      "ai/0d41679fd08b657de692be3741b6b578.jpg",
+      "ai/0e2598ba958720541e64a3a58d235ae5.jpg",
+      "ai/0ed0d62b42b4a6d4821f2733431b721b.jpg",
+      "ai/0fc69ef5faac4518f1f0bbbe38412fd4.jpg",
+      "ai/101b63a639683991d40b19a67ff566ee.jpg",
+      "ai/11cee80988ad427be1667f495d73a855.jpg",
+      "ai/14001cf8f6c37f2d8aed5a3efa15fa3a.jpg"
+    ],
+    "interpretation": "Model leans toward missing AI images (false negatives dominate), suggesting AI fakes are becoming too realistic to spot. Both error types are present: consider threshold tuning and the robustness report to find which transformations expose the model."
+  }
+}
