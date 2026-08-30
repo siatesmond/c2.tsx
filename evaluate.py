@@ -7,6 +7,7 @@ import torch
 from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from tqdm import tqdm
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -57,10 +58,13 @@ def resolve_device(pref):
 
 
 @torch.no_grad()
-def predict_probs(model, loader, device):
+def predict_probs(model, loader, device, desc=None):
     model.eval()
     probs, paths, labels = [], [], []
-    for x, y, ps in loader:
+    # This script makes 16 full passes over the test set (1 clean + 15
+    # robustness transforms) and prints nothing until the very end, which is
+    # indistinguishable from a hang on a large set. Show progress per pass.
+    for x, y, ps in tqdm(loader, desc=desc, unit="batch", leave=False, disable=desc is None):
         x = x.to(device)
         p = torch.sigmoid(model(x)).squeeze(-1).cpu().numpy()
         probs.extend(p.tolist())
@@ -75,11 +79,12 @@ def evaluate_robustness(model, dataset, device, batch_size, threshold, severity)
     per_transform_auc = {}
     per_transform_error = {}
     total = len(dataset)
-    for name, (category, fn) in rob.items():
+    for i, (name, (category, fn)) in enumerate(rob.items(), 1):
         loader = DataLoader(
             _TransformedView(dataset, fn, base_tf),
             batch_size=batch_size, shuffle=False, num_workers=0)
-        probs, labels, _ = predict_probs(model, loader, device)
+        probs, labels, _ = predict_probs(
+            model, loader, device, desc=f"robustness {i}/{len(rob)}: {name}")
         preds = (probs >= threshold).astype(int)
         m, _ = classification_metrics(labels, probs, threshold)
         per_transform_auc[name] = m["roc_auc"]
@@ -149,7 +154,8 @@ def main(weights=BEST_WEIGHTS, data_root=DATA_ROOT, cfg=EVAL_CFG,
         raise SystemExit("Test set is empty. Add images to data/test/{real,ai}.")
 
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
-    probs, labels, paths = predict_probs(model, loader, device)
+    print(f"Scoring {len(ds)} test images (1 clean pass + 15 robustness passes)...")
+    probs, labels, paths = predict_probs(model, loader, device, desc="clean")
     # ROC-AUC is the primary metric and is threshold-independent. Pick the
     # ROC-optimal decision threshold (Youden's J) for all threshold-dependent
     # metrics and error counts so they reflect the best operating point.

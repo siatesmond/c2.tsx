@@ -4,3 +4,12 @@ data/
 venv/
 .idea/
 FAKE/
+.venv/
+
+# Datasets and generated artifacts - never commit these
+coco/
+DALLE/
+__pycache__/
+*.pyc
+eval_report.json
+holdout_index.json
