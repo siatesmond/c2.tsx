@@ -1,0 +1,63 @@
+{
+  "threshold": 0.014920542947947979,
+  "n": 4002,
+  "metrics": {
+    "accuracy": 0.9277861069465267,
+    "precision": 0.9241823587710605,
+    "recall": 0.9320339830084957,
+    "f1": 0.9280915650659368,
+    "roc_auc": 0.9772516290580348,
+    "threshold": 0.014920542947947979
+  },
+  "error_analysis": {
+    "false_positives": 153,
+    "false_negatives": 136,
+    "fp_mean_confidence": 0.29661592046176294,
+    "fn_mean_confidence": 0.003350550155264015,
+    "fp_examples": [
+      "real\\img158957.jpg",
+      "real\\img158970.jpg",
+      "real\\img158978.jpg",
+      "real\\img158980.jpg",
+      "real\\img158994.jpg",
+      "real\\img159008.jpg",
+      "real\\img159011.jpg",
+      "real\\img159034.jpg",
+      "real\\img159036.jpg",
+      "real\\img159046.jpg",
+      "real\\img159058.jpg",
+      "real\\img159065.jpg",
+      "real\\img159071.jpg",
+      "real\\img159091.jpg",
+      "real\\img159095.jpg",
+      "real\\img159097.jpg",
+      "real\\img159101.jpg",
+      "real\\img159111.jpg",
+      "real\\img159119.jpg",
+      "real\\img159121.jpg"
+    ],
+    "fn_examples": [
+      "ai\\01119797a10ff255f2468669387655cb.jpg",
+      "ai\\0159635b70b00eb51a6a274f5b23d819.jpg",
+      "ai\\02db61a11c6e06c8231dcf9dd9db32ab.jpg",
+      "ai\\0432e93fddbea8f6fd3d8cef16e5d5fb.jpg",
+      "ai\\058ddafc9c038ecc1caf6de8b69fe29d.jpg",
+      "ai\\063ab7ab56e59a2eb08a9f3772b244ce.jpg",
+      "ai\\07e873c7a2542748b6d412af8a5564bf.jpg",
+      "ai\\0819ac54426114b847532ee8cbe102d0.jpg",
+      "ai\\08d641ef4d54d58b8f9adcf707d90457.jpg",
+      "ai\\0c262b68149ffca680aac51229254015.jpg",
+      "ai\\0dd439e925da7c04e56c47750b211e00.jpg",
+      "ai\\0ebc875ce5dd006a516b64dac4d9d4f7.jpg",
+      "ai\\101b63a639683991d40b19a67ff566ee.jpg",
+      "ai\\1085325f27bad8b4b78935b73fcddd97.jpg",
+      "ai\\14001cf8f6c37f2d8aed5a3efa15fa3a.jpg",
+      "ai\\15dc2786ab014ed8ac6319bff04b5d41.jpg",
+      "ai\\166f7112a66bfb7ac46a3834019ef620.jpg",
+      "ai\\18f690beb924721883a47f1802e44fde.jpg",
+      "ai\\1b91534ec7663940875a6b419801a6f7.jpg",
+      "ai\\1ceee4a4076b1977e262547376a0449a.jpg"
+    ],
+    "interpretation": "Model leans toward flagging real images as AI (false positives dominate), suggesting it over-triggers on artifacts. Both error types are present: consider threshold tuning and the robustness report to find which transformations expose the model."
+  }
+}

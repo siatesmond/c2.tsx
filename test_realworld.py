@@ -52,7 +52,7 @@ def main():
     ap.add_argument("--weights", default=str(BEST_WEIGHTS), help="Path to best_model.pth")
     ap.add_argument("--model", default=MODEL_CFG.name,
                     help="Model variant (must match the checkpoint): an EfficientNet "
-                         "name (e.g. efficientnet_b2) or 'hybrid_clip'.")
+                         "name (e.g. efficientnet_b2), or hybrid_clip / hybrid_effb0 / hybrid_effb1.")
     ap.add_argument("--threshold", type=float, default=None,
                     help="Force this decision threshold. Default: ROC-optimal (Youden's J) "
                          "on THIS eval set -- note that is an optimistic operating point "
