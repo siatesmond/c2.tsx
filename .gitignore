@@ -2,12 +2,16 @@ data/
 .DS_Store
 .kilo/
 venv/
+.venv/
 .idea/
 FAKE/
 __pycache__/
 *.pyc
+
+# Trained model weights and logs - never commit these (GitHub rejects >100 MB)
 models/
-.venv/
+*.pth
+*.log
 
 # Datasets and generated artifacts - never commit these
 coco/
