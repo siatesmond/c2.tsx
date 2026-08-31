@@ -192,6 +192,21 @@ decimals. Flags: positional `input`, `--model`, `--weights`, `--threshold`
 (`0.5`), `--image_size` (`224`), `--device`, `--output` (`predictions.json`),
 `--quiet`.
 
+### 3.6 Steps to obtain JSON output
+1. Upload images to be analysed
+<img width="1372" height="656" alt="image" src="https://github.com/user-attachments/assets/519ceb09-d82b-4dea-8f2f-569f2d4f47c8" />
+
+2. View results below & click on 'Download JSON' button on the top right to download a copy of the JSON output of all results
+<img width="1390" height="796" alt="image" src="https://github.com/user-attachments/assets/2edab2e4-7a85-4c6a-828b-c1320baf440f" />
+
+3. Click 'Evaluate Report' tab to view evaluation report of the model and the error analysis
+<img width="1441" height="789" alt="image" src="https://github.com/user-attachments/assets/8e585054-652b-4f9a-843e-9e342bb2c216" />
+<img width="1523" height="738" alt="image" src="https://github.com/user-attachments/assets/08d1fb5c-480d-4a34-823f-9dfd5355f8fa" />
+
+The following is a screenshot of how the JSON output looks like:
+<img width="1547" height="822" alt="image" src="https://github.com/user-attachments/assets/4af9a36b-2eab-40b7-bba2-45e9ddaf30a2" />
+
+
 ## 4. Limitations & What We'd Improve
 
 **Limitations**
