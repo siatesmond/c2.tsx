@@ -7,3 +7,10 @@ FAKE/
 __pycache__/
 *.pyc
 models/
+.venv/
+
+# Datasets and generated artifacts - never commit these
+coco/
+DALLE/
+eval_report.json
+holdout_index.json

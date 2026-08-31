@@ -12,6 +12,8 @@
   <header>
     <h1>AI Image Detector</h1>
     <p>Upload images to find out if they are AI-generated or real photographs</p>
+    <!-- Which checkpoint is actually loaded. Filled in by /model-info. -->
+    <div id="model-badge" class="model-badge" title="Loading model info..."></div>
   </header>
 
   <!-- Tab bar -->
@@ -52,15 +54,34 @@
       <div id="file-list" role="list" aria-label="Selected files"></div>
       <button id="analyze-btn" disabled>Analyze Images</button>
       <div id="status" role="status" aria-live="polite"></div>
+
+      <!-- Chunked-upload progress. A folder is posted in batches, so the run
+           has real progress to report rather than one opaque wait. -->
+      <div id="progress-wrap" style="display:none">
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="progress-text">0 / 0</span>
+          <button class="clear-btn" id="cancel-btn" type="button">Cancel</button>
+        </div>
+      </div>
     </div>
 
     <!-- Results -->
     <section id="results-section" aria-label="Detection results">
       <div class="results-header">
         <h2>Results <span id="result-count"></span></h2>
-        <button class="pick-btn" id="download-results-btn" type="button">
-          <span class="btn-icon">⬇️</span> Download JSON
-        </button>
+        <div class="results-actions">
+          <!-- Section 5.5 deliverable: [{image_path, pred}, ...] -->
+          <button class="pick-btn" id="download-preds-btn" type="button">
+            <span class="btn-icon">⬇️</span> predictions.json
+          </button>
+          <!-- Everything else: per-image detail + folder-level metrics -->
+          <button class="pick-btn" id="download-results-btn" type="button">
+            <span class="btn-icon">📄</span> Full report
+          </button>
+        </div>
       </div>
 
       <div id="summary-strip">
@@ -128,8 +149,8 @@
               <th scope="col">Verdict</th>
               <th scope="col" id="th-true-label" style="display:none">True Label</th>
               <th scope="col" id="th-correct"    style="display:none">Correct?</th>
-              <th scope="col">AI Score</th>
-              <th scope="col">Real Score</th>
+              <th scope="col" title="Raw model output — the value exported as 'pred'">AI Score</th>
+              <th scope="col" title="The same score measured against the decision threshold: 50% sits exactly on the boundary">vs Threshold</th>
               <th scope="col">Confidence</th>
               <th scope="col">Dimensions</th>
               <th scope="col">File Size</th>
@@ -139,6 +160,9 @@
           <tbody id="results-body"></tbody>
         </table>
       </div>
+
+      <!-- The table renders a window of rows; huge folders load on demand. -->
+      <div id="table-more" style="display:none"></div>
     </section>
   </div><!-- /tab-analyze -->
 
@@ -231,11 +255,11 @@
       <div id="r-interpretation" class="interpretation-box"></div>
 
       <div class="examples-row">
-        <details class="example-details" id="r-fp-examples-wrap">
+        <details class="example-details" id="r-fp-examples-wrap" open>
           <summary>False positive examples <span id="r-fp-ex-count"></span></summary>
           <ul class="example-list" id="r-fp-examples"></ul>
         </details>
-        <details class="example-details" id="r-fn-examples-wrap">
+        <details class="example-details" id="r-fn-examples-wrap" open>
           <summary>False negative examples <span id="r-fn-ex-count"></span></summary>
           <ul class="example-list" id="r-fn-examples"></ul>
         </details>
@@ -243,6 +267,16 @@
 
     </div><!-- /report-banner -->
   </div><!-- /tab-report -->
+
+  <!-- Full-size image preview, opened by clicking a row's thumbnail -->
+  <div id="lightbox" class="lightbox" style="display:none" role="dialog"
+       aria-modal="true" aria-label="Image preview">
+    <button class="lightbox-close" id="lightbox-close" type="button" aria-label="Close preview">×</button>
+    <figure class="lightbox-figure">
+      <img id="lightbox-img" alt="" />
+      <figcaption id="lightbox-caption"></figcaption>
+    </figure>
+  </div>
 
   <!-- JavaScript -->
   <script>
@@ -271,6 +305,26 @@
     if (!_reportLoaded) { _reportLoaded = true; loadReport(); }
   });
 
+  // ── Which model is serving this page ───────────────────────────────────
+  (async () => {
+    const badge = document.getElementById('model-badge');
+    try {
+      const resp = await fetch('/model-info');
+      const m = await resp.json();
+      if (!resp.ok) throw new Error(m.error || 'HTTP ' + resp.status);
+      badge.innerHTML = `
+        <span class="mb-item"><b>${escHtml(m.architecture)}</b></span>
+        <span class="mb-item">${m.image_size}px</span>
+        <span class="mb-item">threshold ${Number(m.threshold).toPrecision(3)}</span>
+        <span class="mb-item mb-file" title="${escHtml(m.weights)}">${escHtml(m.weights)}</span>`;
+      badge.title = `architecture from ${m.architecture_source}, `
+                  + `input size from ${m.image_size_source}, `
+                  + `threshold from ${m.threshold_source}`;
+    } catch (err) {
+      badge.innerHTML = `<span class="mb-item mb-error">no model loaded — ${escHtml(err.message)}</span>`;
+    }
+  })();
+
   // ═══════════════════════════════════════════════════════════════════════
   // TAB 1 — ANALYZE
   // ═══════════════════════════════════════════════════════════════════════
@@ -285,8 +339,63 @@
   const resultsSection = document.getElementById('results-section');
   const resultsBody    = document.getElementById('results-body');
   const resultCount    = document.getElementById('result-count');
+  const progressWrap   = document.getElementById('progress-wrap');
+  const progressFill   = document.getElementById('progress-fill');
+  const progressText   = document.getElementById('progress-text');
+  const cancelBtn      = document.getElementById('cancel-btn');
+  const tableMore      = document.getElementById('table-more');
 
+  // ── Folder-scale tuning ────────────────────────────────────────────────
+  // A folder of any size works because it is never uploaded in one request.
+  // The queue is sliced into chunks that are posted one after another, so
+  // peak memory (browser AND server) is bounded by one chunk, not by the
+  // size of the folder.
+  const CHUNK_FILES = 16;                  // images per request...
+  const CHUNK_BYTES = 24 * 1024 * 1024;    // ...or this many bytes, whichever hits first
+  const THUMB_LIMIT = 300;                 // stop requesting previews past this many images
+  const TABLE_LIMIT = 200;                 // rows painted into the DOM at a time
+
+  // Selection is keyed by relative path, NOT by bare filename: a dataset
+  // folder normally contains real/0001.jpg AND ai/0001.jpg, and keying on the
+  // name alone would silently drop one of every such pair.
   const selectedMap = new Map();
+
+  // Job state, rebuilt on every run.
+  let _allRows   = [];      // every result row, across all chunks
+  let _aggregate = null;    // folder-level metrics from /aggregate
+  let _rendered  = 0;       // how many rows are currently in the table
+  let _cancelled = false;
+
+  // Running tallies, updated as each chunk lands so the summary cards count
+  // up live instead of sitting at 0 until the run ends. They are incremented
+  // per row rather than recomputed: re-scanning _allRows on every chunk would
+  // be quadratic, which on a six-figure folder means minutes of wasted CPU.
+  let _stats     = { ok: 0, ai: 0, failed: 0 };
+  let _sawLabels = false;   // sticky: did ANY row carry a folder label?
+
+  // Relative path -> the original File, still held by the browser. Past
+  // THUMB_LIMIT the server sends no preview, so the table renders one locally
+  // from the file instead of showing an empty cell.
+  let _fileByPath = new Map();
+
+  // File -> object URL, created lazily and only for rows actually painted
+  // into the table. Never one per uploaded image: a six-figure folder would
+  // mean a six-figure pile of live URLs.
+  const _objectUrls = new Map();
+
+  function objectUrlFor(file) {
+    let url = _objectUrls.get(file);
+    if (!url) { url = URL.createObjectURL(file); _objectUrls.set(file, url); }
+    return url;
+  }
+  function releaseObjectUrls() {
+    for (const url of _objectUrls.values()) URL.revokeObjectURL(url);
+    _objectUrls.clear();
+  }
+
+  // webkitRelativePath is set by the folder picker; _relPath is what the
+  // drag-and-drop walker records; a loose file has neither.
+  function relPathOf(f) { return f.webkitRelativePath || f._relPath || f.name; }
 
   pickFilesBtn.addEventListener('click',  () => fileInput.click());
   pickFolderBtn.addEventListener('click', () => folderInput.click());
@@ -300,7 +409,9 @@
     dropZone.classList.remove('dragover');
     const items = [...(e.dataTransfer.items || [])];
     if (items.length && items[0].webkitGetAsEntry) {
+      setStatus('<span class="spinner"></span>Scanning dropped folder…');
       addFiles(await collectFromEntries(items.map(i => i.webkitGetAsEntry())));
+      setStatus('');
     } else {
       addFiles([...e.dataTransfer.files]);
     }
@@ -315,7 +426,14 @@
         if (entry.isFile) {
           if (!EXT.test(entry.name)) return;
           pending++;
-          entry.file(f => { files.push(f); if (--pending === 0) resolve(files); });
+          entry.file(f => {
+            // Files from a drop have no webkitRelativePath, so carry the
+            // folder path across ourselves -- without it the server cannot
+            // read the real/ or ai/ ground-truth label out of the path.
+            f._relPath = (entry.fullPath || entry.name).replace(/^\//, '');
+            files.push(f);
+            if (--pending === 0) resolve(files);
+          });
         } else if (entry.isDirectory) {
           const reader = entry.createReader(); pending++;
           (function readAll() {
@@ -336,7 +454,7 @@
     let added = 0;
     newFiles.forEach(f => {
       if (!ALLOWED_MIME.has(f.type) && !/\.(jpe?g|png|bmp|webp)$/i.test(f.name)) return;
-      const key = `${f.name}|${f.size}`;
+      const key = `${relPathOf(f)}|${f.size}`;
       if (!selectedMap.has(key)) { selectedMap.set(key, f); added++; }
     });
     if (added) renderQueue();
@@ -350,11 +468,15 @@
     const n = files.length;
     if (n === 0) { analyzeBtn.disabled = true; setStatus(''); return; }
     analyzeBtn.disabled = false;
-    const totalKB = (files.reduce((s, f) => s + f.size, 0) / 1024).toFixed(0);
+    const totalMB = (files.reduce((s, f) => s + f.size, 0) / (1024*1024));
+    const size = totalMB >= 1 ? `${totalMB.toFixed(1)} MB` : `${(totalMB*1024).toFixed(0)} KB`;
     if (n > 8) {
+      // Never list thousands of chips -- one summary line plus the estimated
+      // number of round-trips the run will take.
+      const batches = Math.ceil(n / CHUNK_FILES);
       const div = document.createElement('div');
       div.className = 'queue-summary';
-      div.innerHTML = `<div><span class="q-label">${n} images selected</span><span class="q-meta"> · ${totalKB} KB total</span></div>
+      div.innerHTML = `<div><span class="q-label">${n.toLocaleString()} images selected</span><span class="q-meta"> · ${size} total · ${batches} batch${batches!==1?'es':''}</span></div>
         <button class="clear-btn" id="clear-all-btn" type="button">Clear all</button>`;
       fileList.appendChild(div);
       div.querySelector('#clear-all-btn').addEventListener('click', clearAll);
@@ -375,44 +497,143 @@
     }
   }
 
-  analyzeBtn.addEventListener('click', async () => {
-    const files = [...selectedMap.values()];
+  // ── Run ────────────────────────────────────────────────────────────────
+  analyzeBtn.addEventListener('click', () => runAnalysis([...selectedMap.values()]));
+  cancelBtn.addEventListener('click', () => { _cancelled = true; cancelBtn.disabled = true; });
+
+  async function runAnalysis(files) {
     if (!files.length) return;
+
+    _allRows = []; _aggregate = null; _rendered = 0; _cancelled = false;
+    _stats = { ok: 0, ai: 0, failed: 0 };
+    _sawLabels = false;
+    releaseObjectUrls();
+    _fileByPath = new Map(files.map(f => [relPathOf(f), f]));
     analyzeBtn.disabled = true;
-    setStatus(`<span class="spinner"></span>Analyzing ${files.length} image(s)…`);
-    const form = new FormData();
-    files.forEach(f => { form.append('images', f); form.append('paths[]', f.webkitRelativePath || f.name); });
-    let data;
-    try {
-      const resp = await fetch('/predict', { method: 'POST', body: form });
-      const text = await resp.text();
-      try { data = JSON.parse(text); } catch { throw new Error(`Server returned HTTP ${resp.status}. Check the terminal.`); }
-      if (!resp.ok) throw new Error(data.error || 'Server error ' + resp.status);
-    } catch (err) { setStatus('Error: ' + err.message, true); analyzeBtn.disabled = false; return; }
-    analyzeBtn.disabled = false;
-    setStatus('');
-    _lastResults = data;
-    renderResults(data);
-  });
-
-  function renderResults(data) {
-    const rows      = Array.isArray(data) ? data : (data.results || []);
-    const aggregate = Array.isArray(data) ? null  : (data.aggregate || null);
+    cancelBtn.disabled  = false;
     resultsBody.innerHTML = '';
+    tableMore.style.display = 'none';
     resultsSection.style.display = 'block';
-    const ok        = rows.filter(r => !r.error);
-    const aiCount   = ok.filter(r => r.verdict === 'AI-Generated').length;
-    const hasLabels = aggregate !== null;
+    setStatus('');
+    showProgress(0, files.length);
 
-    document.getElementById('s-total').textContent  = ok.length;
-    document.getElementById('s-ai').textContent     = aiCount;
-    document.getElementById('s-real').textContent   = ok.length - aiCount;
-    document.getElementById('s-thresh').textContent = aggregate ? aggregate.threshold : (ok[0]?.threshold_used ?? '—');
-    resultCount.textContent = `(${rows.length} image${rows.length !== 1 ? 's' : ''})`;
+    let done = 0, requested = 0;
+
+    // One chunk per iteration: bounded by file count AND by total bytes, so a
+    // handful of very large images cannot produce an oversized request.
+    for (let i = 0; i < files.length && !_cancelled; ) {
+      const chunk = [];
+      let bytes = 0;
+      while (i < files.length && chunk.length < CHUNK_FILES &&
+             (chunk.length === 0 || bytes + files[i].size <= CHUNK_BYTES)) {
+        bytes += files[i].size;
+        chunk.push(files[i]);
+        i++;
+      }
+
+      const form = new FormData();
+      chunk.forEach(f => { form.append('images', f); form.append('paths[]', relPathOf(f)); });
+      // Folder-level metrics are computed once at the end instead of per
+      // chunk -- accuracy over a 16-image slice would be meaningless.
+      form.append('aggregate', '0');
+      // Previews are dropped past THUMB_LIMIT so the response payload stays
+      // small on very large folders.
+      form.append('thumbs', requested < THUMB_LIMIT ? '1' : '0');
+      requested += chunk.length;
+
+      let rows;
+      try {
+        const resp = await fetch('/predict', { method: 'POST', body: form });
+        const text = await resp.text();
+        let data;
+        try { data = JSON.parse(text); }
+        catch { throw new Error(`Server returned HTTP ${resp.status}. Check the terminal.`); }
+        if (!resp.ok) throw new Error(data.error || 'Server error ' + resp.status);
+        rows = data.results || [];
+      } catch (err) {
+        // A failed chunk must not sink the whole folder: record the failure
+        // against those files and keep going.
+        rows = chunk.map(f => ({ filename: f.name, image_path: relPathOf(f), error: err.message }));
+      }
+
+      _allRows.push(...rows);
+      tally(rows);
+      appendRows(rows);
+      updateCounts();
+      done += chunk.length;
+      updateProgress(done, files.length);
+    }
+
+    // ── Folder-level metrics over everything that was scored ─────────────
+    const labeled = _allRows
+      .filter(r => !r.error && r.true_label !== null && r.true_label !== undefined)
+      .map(r => ({ true_label: r.true_label, prob_ai: r.prob_ai }));
+
+    if (labeled.length >= 2) {
+      progressText.textContent = 'Computing metrics…';
+      try {
+        const resp = await fetch('/aggregate', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ items: labeled }),
+        });
+        const d = await resp.json();
+        if (resp.ok) _aggregate = d.aggregate;
+      } catch { /* metrics are a bonus; the per-image results still stand */ }
+    }
+
+    hideProgress();
+    analyzeBtn.disabled = false;
+    renderSummary();
+    if (_cancelled) setStatus(`Cancelled after ${_allRows.length.toLocaleString()} of ${files.length.toLocaleString()} images.`, true);
+    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // ── Tallies ────────────────────────────────────────────────────────────
+  function tally(rows) {
+    for (const r of rows) {
+      if (r.error) { _stats.failed++; continue; }
+      _stats.ok++;
+      if (r.verdict === 'AI-Generated') _stats.ai++;
+      if (r.true_label !== null && r.true_label !== undefined) _sawLabels = true;
+    }
+  }
+
+  // Cheap repaint of the four always-visible cards. Safe to call per chunk.
+  function updateCounts() {
+    document.getElementById('s-total').textContent = _stats.ok.toLocaleString();
+    document.getElementById('s-ai').textContent    = _stats.ai.toLocaleString();
+    document.getElementById('s-real').textContent  = (_stats.ok - _stats.ai).toLocaleString();
+    // Until /aggregate runs, show the model's configured threshold rather
+    // than a dash -- it is the cutoff the verdicts in the table actually used.
+    const thr = _aggregate ? _aggregate.threshold
+                           : (_allRows.find(r => !r.error)?.threshold_used ?? null);
+    // A calibrated threshold can be a long float (0.0018815015209838748);
+    // significant digits read better than a fixed decimal count here.
+    document.getElementById('s-thresh').textContent =
+      thr == null ? '—' : (thr >= 0.01 ? Number(thr).toFixed(3) : Number(thr).toPrecision(3));
+    resultCount.textContent = `(${_allRows.length.toLocaleString()} image${_allRows.length !== 1 ? 's' : ''})`;
+  }
+
+  // ── Progress ───────────────────────────────────────────────────────────
+  function showProgress(done, total) {
+    progressWrap.style.display = '';
+    updateProgress(done, total);
+  }
+  function updateProgress(done, total) {
+    const pct = total ? (done / total) * 100 : 0;
+    progressFill.style.width = pct.toFixed(2) + '%';
+    progressText.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} images · ${pct.toFixed(0)}%`;
+  }
+  function hideProgress() { progressWrap.style.display = 'none'; }
+
+  // ── Rendering ──────────────────────────────────────────────────────────
+  function renderSummary() {
+    updateCounts();
 
     const metricsStrip = document.getElementById('metrics-strip');
-    if (hasLabels) {
-      const m = aggregate.metrics, ea = aggregate.error_analysis;
+    if (_aggregate) {
+      const m = _aggregate.metrics, ea = _aggregate.error_analysis;
       const pct = v => (v != null && !isNaN(v)) ? (v*100).toFixed(1)+'%' : '—';
       document.getElementById('s-acc').textContent  = pct(m.accuracy);
       document.getElementById('s-f1').textContent   = pct(m.f1);
@@ -424,63 +645,112 @@
       document.getElementById('s-fp-conf').textContent = ea.fp_mean_confidence != null ? `avg conf ${(ea.fp_mean_confidence*100).toFixed(1)}%` : '';
       document.getElementById('s-fn-conf').textContent = ea.fn_mean_confidence != null ? `avg conf ${(ea.fn_mean_confidence*100).toFixed(1)}%` : '';
       metricsStrip.style.display = '';
-      document.getElementById('th-true-label').style.display = '';
-      document.getElementById('th-correct').style.display    = '';
     } else {
       metricsStrip.style.display = 'none';
-      document.getElementById('th-true-label').style.display = 'none';
-      document.getElementById('th-correct').style.display    = 'none';
     }
+    updateMoreButton();
+  }
 
-    rows.forEach((r, i) => {
-      const tr = document.createElement('tr');
-      if (r.error) {
-        tr.className = 'error-row';
-        tr.innerHTML = `<td>${i+1}</td><td>—</td><td>—</td>
-          <td class="fname" title="${escHtml(r.filename)}">${escHtml(r.filename)}</td>
-          <td colspan="${hasLabels?9:7}">⚠ ${escHtml(r.error)}</td>`;
-      } else {
-        const isAI    = r.verdict === 'AI-Generated';
-        const aiPct   = (r.prob_ai  *100).toFixed(1);
-        const realPct = (r.prob_real*100).toFixed(1);
-        const aiColor   = isAI ? 'var(--ai)'   : 'var(--muted)';
-        const realColor = isAI ? 'var(--muted)' : 'var(--real)';
-        let tlCell = '', okCell = '';
-        if (hasLabels) {
-          const tl = r.true_label;
-          if (tl == null) {
-            tlCell = `<td><span class="badge unknown-badge">Unknown</span></td>`;
-            okCell = `<td><span class="meta-cell">—</span></td>`;
-          } else {
-            tlCell = `<td><span class="badge ${tl===1?'ai':'real'}">${tl===1?'AI':'Real'}</span></td>`;
-            if (r.correct) { okCell = `<td><span class="correct-badge correct">✓ Yes</span></td>`; tr.classList.add('row-correct'); }
-            else           { okCell = `<td><span class="correct-badge wrong">✗ No</span></td>`;   tr.classList.add('row-wrong'); }
-          }
-        }
-        tr.innerHTML = `
-          <td>${i+1}</td>
-          <td><code style="font-size:.78rem;color:var(--accent2)">${escHtml(r.id)}</code></td>
-          <td class="thumb-cell"><img src="${r.thumbnail}" alt="${escHtml(r.filename)}" loading="lazy"/></td>
-          <td class="fname" title="${escHtml(r.filename)}">${escHtml(r.filename)}</td>
-          <td><span class="badge ${isAI?'ai':'real'}">${isAI?' AI-Generated':' Real/Human'}</span></td>
-          ${tlCell}${okCell}
-          <td><div class="prob-bar-wrap"><div class="prob-bar-bg"><div class="prob-bar-fill" style="width:${aiPct}%;background:${aiColor}"></div></div><span class="prob-val">${aiPct}%</span></div></td>
-          <td><div class="prob-bar-wrap"><div class="prob-bar-bg"><div class="prob-bar-fill" style="width:${realPct}%;background:${realColor}"></div></div><span class="prob-val">${realPct}%</span></div></td>
-          <td>${confBadge(r.confidence)}</td>
-          <td class="meta-cell">${r.width} × ${r.height} px</td>
-          <td class="meta-cell">${r.file_size_kb} KB</td>
-          <td class="meta-cell">${r.inference_ms} ms</td>`;
-      }
-      resultsBody.appendChild(tr);
+  // True only when the upload carried folder labels (real/ or ai/ parents).
+  // Reads the sticky flag set by tally() -- scanning every row on each chunk
+  // would be quadratic over a large folder.
+  function hasLabels() { return _sawLabels; }
+
+  function appendRows(rows) {
+    const labels = hasLabels();
+    document.getElementById('th-true-label').style.display = labels ? '' : 'none';
+    document.getElementById('th-correct').style.display    = labels ? '' : 'none';
+
+    // Painting tens of thousands of <tr> would lock the tab, so the table
+    // holds a window of TABLE_LIMIT rows and grows on demand.
+    const frag = document.createDocumentFragment();
+    for (const r of rows) {
+      if (_rendered >= TABLE_LIMIT) break;
+      frag.appendChild(buildRow(r, _rendered, labels));
+      _rendered++;
+    }
+    resultsBody.appendChild(frag);
+    updateMoreButton();
+  }
+
+  function updateMoreButton() {
+    if (_rendered >= _allRows.length) { tableMore.style.display = 'none'; return; }
+    tableMore.style.display = '';
+    tableMore.innerHTML = `<span class="more-note">Showing ${_rendered.toLocaleString()} of ${_allRows.length.toLocaleString()} rows</span>
+      <button class="pick-btn" id="show-more-btn" type="button">Show ${Math.min(TABLE_LIMIT, _allRows.length - _rendered)} more</button>`;
+    tableMore.querySelector('#show-more-btn').addEventListener('click', () => {
+      const labels = hasLabels();
+      const frag = document.createDocumentFragment();
+      const stop = Math.min(_rendered + TABLE_LIMIT, _allRows.length);
+      for (; _rendered < stop; _rendered++) frag.appendChild(buildRow(_allRows[_rendered], _rendered, labels));
+      resultsBody.appendChild(frag);
+      updateMoreButton();
     });
-    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function buildRow(r, i, hasLabels) {
+    const tr = document.createElement('tr');
+    if (r.error) {
+      tr.className = 'error-row';
+      tr.innerHTML = `<td>${i+1}</td><td>—</td><td>—</td>
+        <td class="fname" title="${escHtml(r.image_path || r.filename)}">${escHtml(r.filename)}</td>
+        <td colspan="${hasLabels?9:7}">⚠ ${escHtml(r.error)}</td>`;
+      return tr;
+    }
+    const isAI = r.verdict === 'AI-Generated';
+    // The raw score is unreadable as a bar (everything pins to zero), so the
+    // bars are driven by the threshold-relative score instead. Both bars then
+    // agree with the verdict rather than contradicting it.
+    const cal     = r.calibrated_ai ?? (r.prob_ai >= 0.5 ? 1 : 0);
+    const calPct  = (cal * 100).toFixed(1);
+    const rawPct  = Math.min(100, r.prob_ai * 100).toFixed(1);
+    const calColor = isAI ? 'var(--ai)' : 'var(--real)';
+
+    let tlCell = '', okCell = '';
+    if (hasLabels) {
+      const tl = r.true_label;
+      if (tl === null || tl === undefined) {
+        tlCell = `<td><span class="badge unknown-badge">Unknown</span></td>`;
+        okCell = `<td><span class="meta-cell">—</span></td>`;
+      } else {
+        tlCell = `<td><span class="badge ${tl===1?'ai':'real'}">${tl===1?'AI':'Real'}</span></td>`;
+        if (r.correct) { okCell = `<td><span class="correct-badge correct">✓ Yes</span></td>`; tr.classList.add('row-correct'); }
+        else           { okCell = `<td><span class="correct-badge wrong">✗ No</span></td>`;   tr.classList.add('row-wrong'); }
+      }
+    }
+    // Past THUMB_LIMIT the server sends no preview, to keep the response
+    // small. The original file is still in the browser, so render the preview
+    // from it instead of leaving the cell empty. loading="lazy" keeps the
+    // decode cost to whatever is actually on screen.
+    let thumbSrc = r.thumbnail;
+    if (!thumbSrc) {
+      const file = _fileByPath.get(r.image_path);
+      if (file) thumbSrc = objectUrlFor(file);
+    }
+    const thumb = thumbSrc
+      ? `<img src="${thumbSrc}" alt="${escHtml(r.filename)}" loading="lazy"/>`
+      : `<span class="meta-cell">—</span>`;
+
+    tr.innerHTML = `
+      <td>${i+1}</td>
+      <td><code style="font-size:.78rem;color:var(--accent2)">${escHtml(r.id)}</code></td>
+      <td class="thumb-cell" data-row="${i}" role="button" tabindex="0"
+          title="Click to enlarge" aria-label="Enlarge ${escHtml(r.filename)}">${thumb}</td>
+      <td class="fname" title="${escHtml(r.image_path || r.filename)}">${escHtml(r.filename)}</td>
+      <td><span class="badge ${isAI?'ai':'real'}">${isAI?' AI-Generated':' Real/Human'}</span></td>
+      ${tlCell}${okCell}
+      <td><div class="prob-bar-wrap"><div class="prob-bar-bg"><div class="prob-bar-fill" style="width:${rawPct}%;background:var(--muted)"></div></div><span class="prob-val">${fmtPct(r.prob_ai)}</span></div></td>
+      <td><div class="prob-bar-wrap"><div class="prob-bar-bg"><div class="prob-bar-fill" style="width:${calPct}%;background:${calColor}"></div></div><span class="prob-val">${calPct}%</span></div></td>
+      <td>${confBadge(r.confidence)}</td>
+      <td class="meta-cell">${r.width} × ${r.height} px</td>
+      <td class="meta-cell">${r.file_size_kb} KB</td>
+      <td class="meta-cell">${r.inference_ms} ms</td>`;
+    return tr;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
   // TAB 2 — EVALUATE REPORT
   // ═══════════════════════════════════════════════════════════════════════
-  document.getElementById('load-report-btn').addEventListener('click', loadReport);
-
   document.getElementById('load-report-btn').addEventListener('click', () => {
     _reportLoaded = true;   // manual reload always allowed
     loadReport();
@@ -611,20 +881,163 @@
     const ct = document.getElementById(countId);
     el.innerHTML = '';
     ct.textContent = paths.length ? `(${paths.length})` : '(none)';
+
     paths.forEach(p => {
       const li = document.createElement('li');
-      li.textContent = p;
+      li.className = 'example-item';
+
+      // The report stores absolute paths; /eval-image serves a thumbnail for
+      // any of them that resolves inside the project directory.
+      const img = document.createElement('img');
+      img.className = 'example-thumb';
+      img.loading = 'lazy';
+      img.alt = '';
+      img.src = '/eval-image?path=' + encodeURIComponent(p);
+      // A report generated on another machine points at paths that do not
+      // exist here; show a marker rather than a broken-image icon.
+      img.addEventListener('error', () => {
+        const ph = document.createElement('span');
+        ph.className = 'example-thumb missing';
+        ph.textContent = '?';
+        ph.title = 'Image not found on this machine';
+        img.replaceWith(ph);
+      });
+      img.addEventListener('click', () => showLightbox(img.src, `
+        <div class="lb-path">${escHtml(p)}</div>
+        <div class="lb-facts"><span>${escHtml(listId.includes('fp')
+          ? 'False positive - a REAL image the model called AI'
+          : 'False negative - an AI image the model called real')}</span></div>`));
+
+      const label = document.createElement('span');
+      label.className = 'example-path';
+      label.title = p;
+      label.textContent = shortPath(p);
+
+      li.append(img, label);
       el.appendChild(li);
     });
   }
 
-  // Download analyze results
-  let _lastResults = null;   // holds the most recent {results, aggregate} payload
+  // Reports carry full absolute paths, which are too long to read in a list.
+  function shortPath(p) {
+    const parts = String(p).split(/[\\/]/).filter(Boolean);
+    return parts.slice(-2).join('/');
+  }
 
+  // ── Lightbox ───────────────────────────────────────────────────────────
+  // Delegated from the tbody so it keeps working as rows stream in and as
+  // "Show more" extends the window.
+  const lightbox    = document.getElementById('lightbox');
+  const lightboxImg = document.getElementById('lightbox-img');
+
+  resultsBody.addEventListener('click', e => {
+    const cell = e.target.closest('.thumb-cell[data-row]');
+    if (cell) openLightbox(Number(cell.dataset.row));
+  });
+  resultsBody.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const cell = e.target.closest('.thumb-cell[data-row]');
+    if (cell) { e.preventDefault(); openLightbox(Number(cell.dataset.row)); }
+  });
+
+  // Shared by the results table and the eval-report example lists.
+  function showLightbox(src, captionHtml) {
+    lightboxImg.style.width = '';
+    lightboxImg.onload = () => {
+      const vw = window.innerWidth  || document.documentElement.clientWidth;
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      if (!vw || !vh) return;
+      const scale = Math.min(2, (vw * 0.9) / lightboxImg.naturalWidth,
+                                (vh * 0.7) / lightboxImg.naturalHeight);
+      if (scale > 0) lightboxImg.style.width = (lightboxImg.naturalWidth * scale) + 'px';
+    };
+    lightboxImg.src = src;
+    document.getElementById('lightbox-caption').innerHTML = captionHtml;
+    lightbox.style.display = '';
+    document.body.style.overflow = 'hidden';
+    document.getElementById('lightbox-close').focus();
+  }
+
+  function openLightbox(idx) {
+    const r = _allRows[idx];
+    if (!r || r.error) return;
+
+    // Prefer the original file: full resolution, no server round-trip, and
+    // available whether or not the response carried a thumbnail.
+    const file = _fileByPath.get(r.image_path);
+    if (file)             lightboxImg.src = objectUrlFor(file);
+    else if (r.thumbnail) lightboxImg.src = r.thumbnail;
+    else                  return;
+    lightboxImg.alt = r.filename;
+    // Fit large images to the viewport, and enlarge small ones -- but never
+    // past 2x their real pixels, since upscaling beyond that just blurs the
+    // artifacts you opened the preview to look at.
+    lightboxImg.style.width = '';
+    lightboxImg.onload = () => {
+      const vw = window.innerWidth  || document.documentElement.clientWidth;
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      // An unmeasurable viewport (hidden pane, some embedded contexts) would
+      // otherwise scale the image to 0px; leave the CSS caps to handle it.
+      if (!vw || !vh) return;
+      const scale = Math.min(2, (vw * 0.9) / lightboxImg.naturalWidth,
+                                (vh * 0.7) / lightboxImg.naturalHeight);
+      if (scale > 0) lightboxImg.style.width = (lightboxImg.naturalWidth * scale) + 'px';
+    };
+
+    const isAI = r.verdict === 'AI-Generated';
+    document.getElementById('lightbox-caption').innerHTML = `
+      <div class="lb-path" title="${escHtml(r.image_path || r.filename)}">${escHtml(r.image_path || r.filename)}</div>
+      <div class="lb-facts">
+        <span class="badge ${isAI ? 'ai' : 'real'}">${isAI ? ' AI-Generated' : ' Real/Human'}</span>
+        <span>raw score <b>${fmtPct(r.prob_ai)}</b></span>
+        <span>vs threshold <b>${((r.calibrated_ai ?? 0) * 100).toFixed(1)}%</b></span>
+        ${confBadge(r.confidence)}
+        <span>${r.width} × ${r.height} px</span>
+        <span>${r.file_size_kb} KB</span>
+        ${file ? '' : '<span class="lb-note">thumbnail only — original not in this session</span>'}
+      </div>`;
+
+    lightbox.style.display = '';
+    document.body.style.overflow = 'hidden';
+    document.getElementById('lightbox-close').focus();
+  }
+
+  function closeLightbox() {
+    lightbox.style.display = 'none';
+    document.body.style.overflow = '';
+    lightboxImg.removeAttribute('src');
+  }
+
+  document.getElementById('lightbox-close').addEventListener('click', closeLightbox);
+  // Backdrop click only -- a click on the image itself must not dismiss it.
+  lightbox.addEventListener('click', e => { if (e.target === lightbox) closeLightbox(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && lightbox.style.display !== 'none') closeLightbox();
+  });
+
+  // ── Downloads ──────────────────────────────────────────────────────────
+  // Deliverable format (Section 5.5): a JSON array of {image_path, pred},
+  // one entry per scored image, where pred is the AI-generated likelihood.
+  document.getElementById('download-preds-btn').addEventListener('click', () => {
+    const payload = _allRows
+      .filter(r => !r.error)
+      .map(r => ({ image_path: r.image_path || r.filename, pred: r.prob_ai }));
+    if (!payload.length) return;
+    downloadJson(payload, 'predictions.json');
+  });
+
+  // Full export: every per-image field plus the folder-level metrics and
+  // error analysis, for the write-up and the robustness/error sections.
   document.getElementById('download-results-btn').addEventListener('click', () => {
-    if (!_lastResults) return;
+    if (!_allRows.length) return;
     const ts = new Date().toISOString().slice(0,19).replace(/[:T]/g, '-');
-    downloadJson(_lastResults, `analyze_results_${ts}.json`);
+    downloadJson({
+      generated_at: new Date().toISOString(),
+      n_images:     _allRows.length,
+      n_failed:     _allRows.filter(r => r.error).length,
+      aggregate:    _aggregate,
+      results:      _allRows,
+    }, `analyze_results_${ts}.json`);
   });
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -651,6 +1064,18 @@
     a.click();
     URL.revokeObjectURL(url);
   }
+  // This model's AI scores cluster near zero, where a fixed 1-decimal percent
+  // collapses every distinct value to "0.0%". Keep significant digits instead,
+  // so a 0.003% and a 0.4% stay visibly different.
+  function fmtPct(p) {
+    if (p == null || isNaN(p)) return '—';
+    const pct = p * 100;
+    if (pct >= 1)    return pct.toFixed(1) + '%';
+    if (pct === 0)   return '0%';
+    if (pct >= 0.01) return pct.toFixed(2) + '%';
+    return pct.toPrecision(2) + '%';
+  }
+
   function confBadge(level) {
     const cls = {'Very High':'very-high','High':'high','Moderate':'moderate','Low':'low'}[level]||'low';
     return `<span class="conf-badge ${cls}">${level}</span>`;

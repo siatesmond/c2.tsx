@@ -424,6 +424,18 @@ A browser-based frontend with two tabs:
 - **Analyze Images** - upload images and get per-image AI detection results
 - **Evaluate Report** - view and download the full evaluation report produced by `evaluate.py`
 
+Routes:
+
+| Route | Purpose |
+|---|---|
+| `GET /` | The UI |
+| `POST /predict` | Scores **one chunk** of uploaded images; stateless per chunk |
+| `POST /aggregate` | Folder-level metrics once every chunk has been scored |
+| `GET /eval-report` | The `eval_report.json` written by `evaluate.py` |
+| `GET /eval-report/exists` | Cheap existence check for the above |
+
+Metrics are deliberately **not** computed per chunk - accuracy over whichever 16 images shared a request says nothing about the folder. The frontend collects the `(true_label, prob_ai)` pairs across every chunk and posts them to `/aggregate` once at the end, so accuracy, F1, ROC-AUC, the Youden-optimal threshold and the false positive/negative counts are all computed over the entire upload.
+
 ### Setup
 
 ```bash
@@ -436,7 +448,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Then open **http://127.0.0.1:5000** in your browser.
+Then open **http://127.0.0.1:5001** in your browser.
 
 ---
 
@@ -450,9 +462,24 @@ The interface accepts images three ways:
 - **Browse Folder** - folder picker that automatically includes every image inside, including nested subfolders.
 - **Drag & drop** - drag image files or an entire folder onto the drop zone. The drop handler walks the directory tree recursively via the browser's `FileSystemEntry` API.
 
-All three methods feed into the same queue. Duplicates (same filename + size) are silently ignored. With 8 or fewer files queued the individual filenames are shown as removable chips; with more than 8 a compact summary bar is shown with a "Clear all" button.
+All three methods feed into the same queue. Duplicates are detected by **relative path + size**, not by filename alone - a dataset folder normally holds both `real/0001.jpg` and `ai/0001.jpg`, and keying on the name would drop one of every such pair. With 8 or fewer files queued the individual filenames are shown as removable chips; with more than 8 a compact summary bar is shown with the image count, total size, batch count and a "Clear all" button.
 
-Click **Analyze Images** to submit. Results appear immediately as table rows.
+Click **Analyze Images** to submit. Rows stream into the table as each batch comes back.
+
+#### Folder size
+
+There is **no limit on how many images (or how many bytes) a folder may contain**. The selection is never posted in one request: the frontend slices it into chunks and posts them one after another, so peak memory on both sides is bounded by a single chunk rather than by the folder.
+
+| Knob | Where | Default | Meaning |
+|---|---|---|---|
+| `CHUNK_FILES` | `templates/index.html` | 16 | Images per request |
+| `CHUNK_BYTES` | `templates/index.html` | 24 MB | Byte ceiling per request, whichever limit is hit first |
+| `THUMB_LIMIT` | `templates/index.html` | 300 | Previews are requested only for the first N images; past that the response carries no base-64 payload |
+| `TABLE_LIMIT` | `templates/index.html` | 200 | Rows painted into the DOM at a time, extended by a **Show more** button |
+| `PREDICT_BATCH_SIZE` | env var, `app.py` | 16 | Images stacked into one forward pass |
+| `MAX_UPLOAD_MB` | env var, `app.py` | 0 (off) | Per-request size cap. Caps one chunk, never the job |
+
+A progress bar reports `done / total` across the whole run, with a **Cancel** button that stops after the current chunk and keeps whatever has already been scored. A chunk that fails is recorded as an error against its own files and the run continues.
 
 #### Summary strip
 
@@ -463,7 +490,7 @@ The strip above the table always shows four base cards:
 | Analyzed | Total images successfully processed |
 | AI-Generated | Count the model predicted as AI |
 | Real / Human | Count the model predicted as real |
-| Threshold | Probability cutoff. Auto-tuned to the ROC-optimal value (Youden's J) when labels are present; defaults to 0.5 otherwise |
+| Threshold | Decision cutoff. Auto-tuned to the ROC-optimal value (Youden's J) when labels are present; otherwise the calibrated threshold loaded at startup (see **Calibration** below) |
 
 A second row of metric cards appears **only when ground-truth labels are detected** (images loaded from a folder named `ai/` or `real/`):
 
@@ -483,23 +510,64 @@ A second row of metric cards appears **only when ground-truth labels are detecte
 |---|---|
 | # | Row index |
 | Image ID | Short random hex ID assigned at inference time |
-| Preview | 64 × 64 thumbnail of the uploaded image |
+| Preview | 200 px thumbnail of the uploaded image, for the first `THUMB_LIMIT` images; `—` beyond that |
 | Filename | Original filename |
 | Verdict | AI-Generated or Real / Human |
 | True Label | *(label mode only)* Ground truth inferred from folder name |
 | Correct? | *(label mode only)* ✓ Yes (green) or ✗ No (red). Rows are tinted accordingly |
-| AI Score | Model's AI-likelihood probability (0–100%) with a fill bar |
-| Real Score | `100% − AI Score` with a fill bar |
-| Confidence | Distance from the 50% boundary - **Very High** (≥ 90%), **High** (≥ 75%), **Moderate** (≥ 60%), **Low** |
+| AI Score | **Raw** model output — the exact value exported as `pred` in predictions.json |
+| vs Threshold | The same score measured against the decision threshold, where **50% sits exactly on the boundary**. This is the number that agrees with the verdict |
+| Confidence | Distance from the **decision threshold** (not from 50%) - **Very High** (≥ 90%), **High** (≥ 75%), **Moderate** (≥ 60%), **Low** |
 | Dimensions | Original image width × height in pixels |
 | File Size | Upload size in KB |
-| Inference | Time the model spent on that single image (ms) |
+| Inference | Model time per image (ms) - the batch's total divided by its size, since images are scored in batches |
 
-A **Download JSON** button in the results header exports the full `{ results, aggregate }` payload as a timestamped JSON file. Thumbnails are stripped from the download to keep the file small.
+Two download buttons sit in the results header:
+
+- **predictions.json** - the Section 5.5 deliverable exactly: a JSON array of `{ image_path, pred }`, one entry per scored image, where `pred` is the AI-generated likelihood in `[0, 1]`. This is the same schema `inference.py` writes from the command line.
+- **Full report** - everything else: every per-image field plus the folder-level `aggregate` block (metrics + error analysis), as a timestamped JSON file. Thumbnails are stripped to keep the file small.
+
+```json
+[
+  { "image_path": "dataset/real/0000.jpg", "pred": 0.0527 },
+  { "image_path": "dataset/ai/0000.jpg",   "pred": 0.9412 }
+]
+```
+
+#### Calibration
+
+**The raw score is not a probability, and 0.5 is the wrong cutoff for this model.**
+
+`realworld_eval_2k.json` (4,000 images) records a ROC-AUC of **0.972** alongside a ROC-optimal
+threshold of **0.0019**. The model ranks AI above real very well, but its outputs are compressed
+against zero — even the real images it finds *most* AI-looking only reach a score of 0.063. Judged
+at 0.5, essentially every image on earth is classified "Real / Human".
+
+So `app.py` does not hardcode 0.5. At startup it loads a threshold that was actually fitted to this
+model's outputs, searching in order:
+
+1. the `THRESHOLD` environment variable, if set
+2. `realworld_eval_2k.json` / `realworld_eval.json` (written by `test_realworld.py`)
+3. `eval_report.json` (written by `evaluate.py`)
+4. `EVAL_CFG.threshold` — the uncalibrated 0.5 fallback, used only when no report exists
+
+The chosen value and its source are printed on startup. To experiment without editing anything:
+
+```bash
+THRESHOLD=0.01 python app.py
+```
+
+Because the raw scores span orders of magnitude, the UI also shows a **vs Threshold** column: the
+same score remapped in log space so that 50% sits on the decision boundary, saturating three decades
+out. Without it a genuine AI detection reads as "AI score 0.28% / Real score 99.7%", which looks
+like the app contradicting itself. **Confidence** is likewise measured from the threshold, not from
+0.5 — otherwise every image scores "Very High" purely because every raw score is far below 0.5.
+
+The raw value is still what `predictions.json` exports, unchanged.
 
 #### Label detection
 
-Labels are inferred from the folder name in the file's relative path (via `webkitRelativePath`):
+Labels are inferred from the folder name in the file's relative path - `webkitRelativePath` for the folder picker, the walked `FileSystemEntry.fullPath` for drag-and-drop:
 
 - `ai`, `ai_generated`, `fake`, `synthetic` → label 1 (AI)
 - `real`, `human`, `authentic`, `genuine` → label 0 (Real)

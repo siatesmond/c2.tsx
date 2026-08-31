@@ -3,6 +3,8 @@ import json
 import random
 from pathlib import Path
 
+from dataclasses import replace
+
 import numpy as np
 import torch
 from PIL import Image, ImageFile
@@ -57,6 +59,21 @@ class TestImageDataset(Dataset):
         p, label = self.items[idx]
         img = Image.open(p).convert("RGB")
         return self.transform(img), label, str(p)
+
+
+def checkpoint_meta(path):
+    """(model_name, image_size, threshold) recorded inside a checkpoint."""
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None, None, None
+    if not isinstance(obj, dict):
+        return None, None, None
+    cfg = obj.get("config")
+    metrics = obj.get("metrics")
+    return (obj.get("model_name"),
+            cfg.get("image_size") if isinstance(cfg, dict) else None,
+            metrics.get("threshold") if isinstance(metrics, dict) else None)
 
 
 def resolve_device(pref):
@@ -159,7 +176,20 @@ def _interpret(n_fp, n_fn, n):
 def main(weights=BEST_WEIGHTS, data_root=DATA_ROOT, cfg=EVAL_CFG,
          rob_cfg=ROBUSTNESS_CFG, limit=None, threshold_override=None):
     device = resolve_device(cfg.device)
-    model = build_model(device=device)
+
+    # Build the architecture and input size the checkpoint was trained with.
+    # Previously this always built efficientnet_b0 at 224px: a b1 checkpoint
+    # would fail to load, and a 240px model would be scored at the wrong
+    # resolution with nothing to indicate it.
+    name, image_size, _ = checkpoint_meta(weights)
+    model_cfg = replace(MODEL_CFG, name=name) if name else MODEL_CFG
+    if image_size:
+        cfg = replace(cfg, image_size=image_size)
+    print(f"Model: {model_cfg.name} @ {cfg.image_size}px  (from {Path(weights).name})")
+
+    # pretrained=False: the checkpoint overwrites every parameter, and the
+    # download fails on networks with strict TLS.
+    model = build_model(replace(model_cfg, pretrained=False), device=device)
     load_best_weights(model, weights, device)
 
     ds = TestImageDataset(data_root, cfg.image_size, model_name=MODEL_CFG.name,
