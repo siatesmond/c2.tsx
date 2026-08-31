@@ -18,10 +18,10 @@ import numpy as np
 import torch
 from pathlib import Path
 from PIL import Image, ImageFile
-from torchvision import transforms
 from tqdm import tqdm
 
 from config import BEST_WEIGHTS, MODEL_CFG, ModelConfig, weights_path
+from datasets import build_transform
 from model import build_model, load_best_weights
 from metrics import classification_metrics, optimal_threshold
 from evaluate import error_analysis
@@ -47,22 +47,17 @@ def gather(root, cls, label):
     return [(q, label) for q in sorted(p.iterdir()) if q.suffix.lower() in exts]
 
 
-# Preprocessing must match training exactly: resize -> ToTensor -> ImageNet norm.
-TF = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
-
-
 def main():
     ap = argparse.ArgumentParser(description="Test best model on real-world real/ai folders.")
     ap.add_argument("--root", default=".", help="Folder containing real/ and ai/ subfolders")
     ap.add_argument("--weights", default=str(BEST_WEIGHTS), help="Path to best_model.pth")
     ap.add_argument("--model", default=MODEL_CFG.name,
-                    help="TorchVision EfficientNet variant (e.g. efficientnet_b2)")
-    ap.add_argument("--threshold", type=float, default=0.5, help="Decision boundary")
+                    help="Model variant (must match the checkpoint): an EfficientNet "
+                         "name (e.g. efficientnet_b2), or hybrid_clip / hybrid_effb0 / hybrid_effb1.")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="Force this decision threshold. Default: ROC-optimal (Youden's J) "
+                         "on THIS eval set -- note that is an optimistic operating point "
+                         "for a held-out set; pass 0.5 for a stricter read.")
     ap.add_argument("--batch_size", type=int, default=64, help="Images per forward pass")
     ap.add_argument("--max_per_class", type=int, default=None,
                     help="Cap samples per class (e.g. 2000 for real, all for ai)")
@@ -76,6 +71,9 @@ def main():
         a.weights = str(weights_path(a.model))
 
     device = resolve_device(a.device)
+    # Keep the shared singleton in sync so anything that reads MODEL_CFG.name
+    # (e.g. build_model's hybrid dispatch) sees the right variant.
+    MODEL_CFG.name = a.model
     model_cfg = ModelConfig(name=a.model, pretrained=MODEL_CFG.pretrained,
                             num_classes=MODEL_CFG.num_classes, dropout=MODEL_CFG.dropout)
     print(f"Device: {device} | model: {model_cfg.name}")
@@ -84,6 +82,10 @@ def main():
     print(f"Loading weights from {a.weights} ...")
     load_best_weights(model, a.weights, device)  # populates models/best_model.pth
     print("Model ready.")
+
+    # Same preprocessing the model was trained with: 4-channel RGB+FFT tensor for
+    # the hybrid detector, ImageNet-normalised 3-channel otherwise.
+    tf = build_transform(224, train=False, model_name=a.model)
 
     real_items = gather(a.root, "real", 0)
     ai_items = gather(a.root, "ai", 1)
@@ -107,7 +109,7 @@ def main():
                           desc="scoring", unit="batch"):
             batch = items[start:start + a.batch_size]
             # Stack the batch into a single tensor for one forward pass.
-            x = torch.stack([TF(Image.open(p).convert("RGB")) for p, _ in batch]).to(device)
+            x = torch.stack([tf(Image.open(p).convert("RGB")) for p, _ in batch]).to(device)
             p = torch.sigmoid(model(x)).squeeze(-1).cpu().numpy()
             probs.extend(p.tolist())
             labels.extend(y for _, y in batch)
@@ -115,8 +117,9 @@ def main():
     print(f"Scored all {len(probs)} images")
     probs, labels = np.array(probs), np.array(labels)
 
-    # ROC-AUC is the primary metric; use the ROC-optimal threshold for hard metrics.
-    best_thr = optimal_threshold(labels, probs)
+    # ROC-AUC is the primary metric (threshold-independent). Hard metrics use
+    # the forced --threshold if given, else the ROC-optimal one for this set.
+    best_thr = a.threshold if a.threshold is not None else optimal_threshold(labels, probs)
     m, _ = classification_metrics(labels, probs, best_thr)
     m["threshold"] = best_thr
     err = error_analysis(probs, labels, paths, best_thr)

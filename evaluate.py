@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 from pathlib import Path
 
 from dataclasses import replace
@@ -8,27 +9,27 @@ import numpy as np
 import torch
 from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 from tqdm import tqdm
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from augmentations import get_robustness_transforms
-from config import BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, MODEL_CFG, ROBUSTNESS_CFG
-from metrics import (classification_metrics, robustness_score, final_score,
-                     optimal_threshold)
+from config import (BEST_WEIGHTS, DATA_ROOT, EVAL_CFG, MODEL_CFG,
+                    ROBUSTNESS_CFG, weights_path)
+from datasets import build_transform
+from metrics import (classification_metrics, final_score, optimal_threshold,
+                     robustness_score)
 from model import build_model, load_best_weights
 
 
 class TestImageDataset(Dataset):
-    def __init__(self, root, image_size):
+    def __init__(self, root, image_size, model_name=None, limit=None, seed=42):
         self.root = Path(root)
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ])
+        # Same pipeline the training set uses for this model (4-channel
+        # RGB+FFT tensor for the hybrid detector, ImageNet-normalised 3-channel
+        # otherwise).
+        self.transform = build_transform(image_size, train=False,
+                                         model_name=model_name)
         self.items = []
         for cls_idx, cls in enumerate(["real", "ai"]):
             folder = self.root / "test" / cls
@@ -39,6 +40,17 @@ class TestImageDataset(Dataset):
                     if "_l1_" in p.stem or "_l2_" in p.stem:
                         continue
                     self.items.append((p, cls_idx))
+        if limit and limit < len(self.items):
+            # Keep a label-balanced random subset -- the robustness pass runs
+            # the whole set 15 times, so a smoke test needs a small `limit`.
+            rng = random.Random(seed)
+            pos = [it for it in self.items if it[1] == 1]
+            neg = [it for it in self.items if it[1] == 0]
+            rng.shuffle(pos)
+            rng.shuffle(neg)
+            half = max(1, limit // 2)
+            self.items = pos[:half] + neg[:half]
+            rng.shuffle(self.items)
 
     def __len__(self):
         return len(self.items)
@@ -78,32 +90,33 @@ def resolve_device(pref):
 def predict_probs(model, loader, device, desc=None):
     model.eval()
     probs, paths, labels = [], [], []
-    # This script makes 16 full passes over the test set (1 clean + 15
-    # robustness transforms) and prints nothing until the very end, which is
-    # indistinguishable from a hang on a large set. Show progress per pass.
-    for x, y, ps in tqdm(loader, desc=desc, unit="batch", leave=False, disable=desc is None):
+    for x, y, ps in tqdm(loader, desc=desc or "predict", leave=False):
         x = x.to(device)
         p = torch.sigmoid(model(x)).squeeze(-1).cpu().numpy()
-        probs.extend(p.tolist())
+        probs.extend(np.atleast_1d(p).tolist())
         labels.extend(y.tolist())
         paths.extend(ps)
     return np.array(probs), np.array(labels), paths
 
 
 def evaluate_robustness(model, dataset, device, batch_size, threshold, severity):
+    # Per-transform score is ROC-AUC (threshold-independent, our primary metric);
+    # the error count is still reported at the chosen decision `threshold`.
     base_tf = dataset.transform
     rob = get_robustness_transforms(severity)
     per_transform_auc = {}
     per_transform_error = {}
-    total = len(dataset)
+    n = len(rob)
+    # Each transform is a full pass over the test set, so this loop does n
+    # extra inference passes -- print which one is running so the process
+    # visibly progresses instead of looking hung.
     for i, (name, (category, fn)) in enumerate(rob.items(), 1):
+        print(f"  robustness [{i:2d}/{n}] {name} ...", flush=True)
         loader = DataLoader(
             _TransformedView(dataset, fn, base_tf),
             batch_size=batch_size, shuffle=False, num_workers=0)
-        probs, labels, _ = predict_probs(
-            model, loader, device, desc=f"robustness {i}/{len(rob)}: {name}")
-        preds = (probs >= threshold).astype(int)
-        m, _ = classification_metrics(labels, probs, threshold)
+        probs, labels, _ = predict_probs(model, loader, device, desc=name)
+        m, preds = classification_metrics(labels, probs, threshold)
         per_transform_auc[name] = m["roc_auc"]
         per_transform_error[name] = int((preds != labels).sum())
     return per_transform_auc, per_transform_error
@@ -161,7 +174,7 @@ def _interpret(n_fp, n_fn, n):
 
 
 def main(weights=BEST_WEIGHTS, data_root=DATA_ROOT, cfg=EVAL_CFG,
-         rob_cfg=ROBUSTNESS_CFG):
+         rob_cfg=ROBUSTNESS_CFG, limit=None, threshold_override=None):
     device = resolve_device(cfg.device)
 
     # Build the architecture and input size the checkpoint was trained with.
@@ -179,17 +192,25 @@ def main(weights=BEST_WEIGHTS, data_root=DATA_ROOT, cfg=EVAL_CFG,
     model = build_model(replace(model_cfg, pretrained=False), device=device)
     load_best_weights(model, weights, device)
 
-    ds = TestImageDataset(data_root, cfg.image_size)
+    ds = TestImageDataset(data_root, cfg.image_size, model_name=MODEL_CFG.name,
+                          limit=limit)
     if len(ds) == 0:
         raise SystemExit("Test set is empty. Add images to data/test/{real,ai}.")
+    rob_passes = len(get_robustness_transforms(rob_cfg.severity))
+    print(f"Test samples: {len(ds)} | device: {device} | "
+          f"{1 + rob_passes} inference passes (1 clean + {rob_passes} robustness)",
+          flush=True)
 
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
-    print(f"Scoring {len(ds)} test images (1 clean pass + 15 robustness passes)...")
+    print("clean pass ...", flush=True)
     probs, labels, paths = predict_probs(model, loader, device, desc="clean")
+
     # ROC-AUC is the primary metric and is threshold-independent. Pick the
     # ROC-optimal decision threshold (Youden's J) for all threshold-dependent
-    # metrics and error counts so they reflect the best operating point.
-    best_thr = optimal_threshold(labels, probs)
+    # metrics and error counts so they reflect the best operating point --
+    # unless the caller forced one with --threshold.
+    best_thr = (threshold_override if threshold_override is not None
+                else optimal_threshold(labels, probs))
     metrics, _ = classification_metrics(labels, probs, best_thr)
     metrics["threshold"] = best_thr
 
@@ -242,17 +263,30 @@ def main(weights=BEST_WEIGHTS, data_root=DATA_ROOT, cfg=EVAL_CFG,
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Evaluate real-vs-AI detector.")
-    ap.add_argument("--weights", default=str(BEST_WEIGHTS))
+    ap.add_argument("--model", type=str, default=MODEL_CFG.name,
+                    help="Model variant to build (must match the checkpoint): "
+                         "an EfficientNet name, or hybrid_clip / hybrid_effb0 / hybrid_effb1.")
+    ap.add_argument("--weights", default=None,
+                    help="Checkpoint path. Defaults to the standard path for --model.")
     ap.add_argument("--data_root", default=str(DATA_ROOT))
-    ap.add_argument("--threshold", type=float, default=EVAL_CFG.threshold)
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="Force this decision threshold. Default: the ROC-optimal "
+                         "threshold (Youden's J) computed on the clean test set.")
     ap.add_argument("--severity", type=float, default=ROBUSTNESS_CFG.severity)
     ap.add_argument("--device", type=str, default=EVAL_CFG.device)
+    ap.add_argument("--limit", type=int, default=None,
+                    help="Evaluate on a label-balanced random subset of this many "
+                         "test images. Use for a fast check -- the robustness pass "
+                         "runs the full set 15 times otherwise.")
     return ap.parse_args()
 
 
 if __name__ == "__main__":
     a = parse_args()
-    EVAL_CFG.threshold = a.threshold
+    # Set the shared model name before build_model() / dataset construction.
+    MODEL_CFG.name = a.model
+    weights = a.weights or str(weights_path(a.model))
     EVAL_CFG.device = a.device
     ROBUSTNESS_CFG.severity = a.severity
-    main(Path(a.weights), Path(a.data_root), EVAL_CFG, ROBUSTNESS_CFG)
+    main(Path(weights), Path(a.data_root), EVAL_CFG, ROBUSTNESS_CFG,
+         limit=a.limit, threshold_override=a.threshold)

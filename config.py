@@ -53,7 +53,7 @@ class TrainConfig:
     image_size: int = 224
     batch_size: int = 32
     # Total training epochs (early stopping may end sooner).
-    num_epochs: int = 30
+    num_epochs: int = 8
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     # Multiplicative decay applied to weight_decay each epoch.
@@ -68,7 +68,13 @@ class TrainConfig:
     # Stop training after this many epochs without improvement on `monitor`.
     early_stopping_patience: int = 8
     # Validation metric used to pick the best model and for early stopping.
+    # roc_auc is threshold-independent -- more stable than f1, which swings with
+    # the per-epoch Youden's-J threshold.
     monitor: str = "roc_auc"
+    # Run the (15-transform) validation robustness eval every N epochs. It is a
+    # full pass over the val set per transform, so raise this for slow models
+    # (e.g. --robust_eval_every 5 for hybrid_clip on MPS/CPU).
+    robust_eval_every: int = 1
     # Decision threshold for converting probabilities to class predictions.
     threshold: float = 0.5
     # Master on/off switch for training-time augmentation. Which family gets
@@ -82,8 +88,6 @@ class TrainConfig:
     device: str = "auto"
     # Use automatic mixed precision (only effective on cuda).
     amp: bool = True
-    # Run the heavier robustness evaluation every N epochs (1 = every epoch).
-    robust_eval_every: int = 1
 
 
 @dataclass
@@ -101,6 +105,62 @@ class RobustnessConfig:
     severity: float = 0.5
     # False -> robustness score is the plain mean accuracy over all 15 transforms.
     weight_by_severity: bool = False
+
+
+@dataclass
+class HybridConfig:
+    """Config for the two-branch hybrid detector (model.HybridDetector),
+    selected with `--model hybrid_clip`.
+
+    Branch A (semantic): a frozen CLIP vision encoder. It never trains, so it
+    can't memorise a generator's fingerprint or a dataset's capture style --
+    it contributes a fixed, transformation-robust "does this scene look
+    plausible" prior.
+
+    Branch B (low-level): two fused sub-streams --
+      * spatial: a fixed high-pass residual (img - gaussian_blur(img)) fed to a
+        small CNN. The high-pass step strips scene layout / colour / exposure
+        (all easy dataset shortcuts) so the CNN sees mostly texture + noise.
+      * frequency: the per-patch FFT spectrogram from frequency.py fed to a
+        small CNN.
+    Their features are concatenated into one low-level vector, which is then
+    fused with the projected CLIP vector for the final logit.
+    """
+
+    # --- semantic branch ---------------------------------------------------
+    # HuggingFace id (or local path) of the CLIP checkpoint. The vision tower
+    # of ViT-B/32 is ~87M params; frozen, so it adds no trainable weight.
+    clip_model_id: str = "openai/clip-vit-base-patch32"
+    clip_feature_dim: int = 768          # pooler_output width for ViT-B/32
+    clip_proj_dim: int = 256             # width after our learned projection
+    freeze_clip: bool = True            # keep True: see docstring / shortcut notes
+
+    # --- low-level branch: spatial sub-stream -----------------------------
+    residual_blur_sigma: float = 1.0    # sigma of the fixed blur in the high-pass
+    residual_kernel: int = 5           # odd kernel size for that blur
+    spatial_feat_dim: int = 128
+    # Which network processes the high-pass residual:
+    #   "smallcnn"        -> the tiny ~0.3M-param CNN (default, shortcut-resistant)
+    #   "efficientnet_b0" / "efficientnet_b1" / ... -> a torchvision EfficientNet
+    #     backbone (more capacity; set by --model hybrid_effb0 / hybrid_effb1).
+    # This field is set automatically from the --model name (see
+    # HYBRID_SPATIAL_BACKBONE / build_model); edit only for experiments.
+    spatial_backbone: str = "smallcnn"
+    spatial_pretrained: bool = True    # ImageNet init for an EfficientNet spatial backbone
+    spatial_trainable: bool = True     # fine-tune it (vs. frozen feature extractor)
+
+    # --- low-level branch: frequency sub-stream --------------------------
+    # Image is split into freq_grid x freq_grid patches for the per-patch FFT
+    # (frequency.compute_freq_spectrogram). 224 / 7 = 32 px patches.
+    freq_grid: int = 7
+    freq_feat_dim: int = 96
+
+    # width of the fused (spatial + frequency) low-level vector
+    lowlevel_dim: int = 128
+
+    # --- fusion head -----------------------------------------------------
+    head_hidden: int = 128
+    dropout: float = 0.3
 
 
 @dataclass
@@ -172,12 +232,33 @@ EVAL_SEVERITY_POINTS = {
 }
 
 
+# Name that selects the hybrid detector wherever a model name is accepted
+# (train.py/evaluate.py/inference.py --model). Any other value is treated as a
+# torchvision EfficientNet variant.
+HYBRID_MODEL_NAME = "hybrid_clip"
+
+# Hybrid detector variants: --model name -> which network runs the low-level
+# spatial sub-stream. Every variant keeps the frozen CLIP branch and the FFT
+# branch; only the spatial branch differs. Each name gets its own checkpoint
+# (weights_path() -> models/best_model_<name>.pth).
+HYBRID_SPATIAL_BACKBONE = {
+    "hybrid_clip": "smallcnn",
+    "hybrid_effb0": "efficientnet_b0",
+    "hybrid_effb1": "efficientnet_b1",
+}
+
+
+def is_hybrid(name):
+    """True if `name` selects a HybridDetector variant."""
+    return name in HYBRID_SPATIAL_BACKBONE
+
 # Singleton config instances imported across the project.
 MODEL_CFG = ModelConfig()
 TRAIN_CFG = TrainConfig()
 EVAL_CFG = EvalConfig()
 ROBUSTNESS_CFG = RobustnessConfig()
 TRAIN_AUG_CFG = TrainAugConfig()
+HYBRID_CFG = HybridConfig()
 
 # Default checkpoint path for the currently configured model variant (used as
 # the default --weights in evaluate.py/inference.py). If you train a
