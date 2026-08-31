@@ -15,12 +15,15 @@ Two detectors, both emitting a single logit (sigmoid -> P(AI-generated)):
 checkpoint saved by train.py for either architecture.
 """
 
+import dataclasses
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 
-from config import HYBRID_CFG, HYBRID_MODEL_NAME, MODEL_CFG
+from config import (HYBRID_CFG, HYBRID_MODEL_NAME, HYBRID_SPATIAL_BACKBONE,
+                    MODEL_CFG, is_hybrid)
 
 
 class EfficientNetDetector(nn.Module):
@@ -112,14 +115,14 @@ class HybridDetector(nn.Module):
     CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
     CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
-    def __init__(self, cfg=HYBRID_CFG, dropout=None):
+    def __init__(self, cfg=HYBRID_CFG, dropout=None, name=HYBRID_MODEL_NAME):
         super().__init__()
         # Imported lazily so the rest of the codebase (and the EfficientNet
         # path) doesn't hard-depend on `transformers` being installed.
         from transformers import CLIPVisionModel
 
         self.cfg = cfg
-        self.name = HYBRID_MODEL_NAME
+        self.name = name
         dropout = cfg.dropout if dropout is None else dropout
 
         # --- semantic branch: frozen CLIP vision tower -------------------
@@ -152,7 +155,29 @@ class HybridDetector(nn.Module):
         # depthwise kernel: one (1, k, k) filter per RGB channel -> (3, 1, k, k)
         self.register_buffer(
             "blur_kernel", kern.view(1, 1, k, k).expand(3, 1, k, k).contiguous())
-        self.spatial_cnn = _SmallCNN(3, cfg.spatial_feat_dim)
+
+        # The residual can be processed by the tiny CNN (default) or by a
+        # torchvision EfficientNet backbone (--model hybrid_effb0 / hybrid_effb1).
+        # An EfficientNet adds ~5-8M params and a lot more capacity -- better
+        # clean-data ceiling, but more overfitting / dataset-shortcut risk and
+        # more VRAM (may need a smaller --batch_size).
+        self.spatial_backbone = cfg.spatial_backbone
+        if self.spatial_backbone == "smallcnn":
+            self.spatial_cnn = _SmallCNN(3, cfg.spatial_feat_dim)
+        else:
+            builder = getattr(models, self.spatial_backbone, None)
+            if builder is None:
+                raise ValueError(f"Unknown spatial_backbone: {self.spatial_backbone}")
+            net = builder(weights="DEFAULT" if cfg.spatial_pretrained else None)
+            feat_dim = net.classifier[1].in_features  # 1280 for efficientnet_b0/b1
+            net.classifier = nn.Identity()            # -> (B, feat_dim) pooled features
+            if not cfg.spatial_trainable:
+                for p in net.parameters():
+                    p.requires_grad_(False)
+                net.eval()
+            self.spatial_net = net
+            self.spatial_proj = nn.Sequential(
+                nn.Linear(feat_dim, cfg.spatial_feat_dim), nn.ReLU(inplace=True))
 
         # --- low-level branch: frequency sub-stream ------------------
         self.freq_cnn = _SmallCNN(1, cfg.freq_feat_dim)
@@ -177,11 +202,13 @@ class HybridDetector(nn.Module):
         self.register_buffer("clip_std", torch.tensor(self.CLIP_STD).view(1, 3, 1, 1))
 
     def train(self, mode=True):
-        # Keep the frozen encoder in eval mode even when the detector is put in
-        # train mode, so its LayerNorm/dropout behaviour never changes.
+        # Keep frozen sub-networks in eval mode even when the detector is put in
+        # train mode, so their BatchNorm/LayerNorm/dropout behaviour never changes.
         super().train(mode)
         if self.cfg.freeze_clip:
             self.clip.eval()
+        if self.spatial_backbone != "smallcnn" and not self.cfg.spatial_trainable:
+            self.spatial_net.eval()
         return self
 
     def _high_pass(self, rgb01):
@@ -204,7 +231,11 @@ class HybridDetector(nn.Module):
 
         clip_feat = self.clip_proj(self._clip_features(rgb01))
 
-        spatial_feat = self.spatial_cnn(self._high_pass(rgb01))
+        resid = self._high_pass(rgb01)
+        if self.spatial_backbone == "smallcnn":
+            spatial_feat = self.spatial_cnn(resid)
+        else:
+            spatial_feat = self.spatial_proj(self.spatial_net(resid))
         freq_feat = self.freq_cnn(spec)
         lowlevel = self.lowlevel_fuse(torch.cat([spatial_feat, freq_feat], dim=1))
 
@@ -218,8 +249,12 @@ class HybridDetector(nn.Module):
 def build_model(cfg=MODEL_CFG, device=None):
     # Construct the detector and optionally move it to the target device.
     name = getattr(cfg, "name", cfg)
-    if name == HYBRID_MODEL_NAME:
-        model = HybridDetector(HYBRID_CFG)
+    if is_hybrid(name):
+        # Pick the low-level spatial backbone from the --model name; every hybrid
+        # variant shares the same HybridConfig otherwise.
+        hcfg = dataclasses.replace(
+            HYBRID_CFG, spatial_backbone=HYBRID_SPATIAL_BACKBONE[name])
+        model = HybridDetector(hcfg, name=name)
     else:
         model = EfficientNetDetector(cfg.name, cfg.pretrained,
                                      cfg.num_classes, cfg.dropout)

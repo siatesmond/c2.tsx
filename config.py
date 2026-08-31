@@ -139,6 +139,15 @@ class HybridConfig:
     residual_blur_sigma: float = 1.0    # sigma of the fixed blur in the high-pass
     residual_kernel: int = 5           # odd kernel size for that blur
     spatial_feat_dim: int = 128
+    # Which network processes the high-pass residual:
+    #   "smallcnn"        -> the tiny ~0.3M-param CNN (default, shortcut-resistant)
+    #   "efficientnet_b0" / "efficientnet_b1" / ... -> a torchvision EfficientNet
+    #     backbone (more capacity; set by --model hybrid_effb0 / hybrid_effb1).
+    # This field is set automatically from the --model name (see
+    # HYBRID_SPATIAL_BACKBONE / build_model); edit only for experiments.
+    spatial_backbone: str = "smallcnn"
+    spatial_pretrained: bool = True    # ImageNet init for an EfficientNet spatial backbone
+    spatial_trainable: bool = True     # fine-tune it (vs. frozen feature extractor)
 
     # --- low-level branch: frequency sub-stream --------------------------
     # Image is split into freq_grid x freq_grid patches for the per-patch FFT
@@ -227,6 +236,21 @@ EVAL_SEVERITY_POINTS = {
 # (train.py/evaluate.py/inference.py --model). Any other value is treated as a
 # torchvision EfficientNet variant.
 HYBRID_MODEL_NAME = "hybrid_clip"
+
+# Hybrid detector variants: --model name -> which network runs the low-level
+# spatial sub-stream. Every variant keeps the frozen CLIP branch and the FFT
+# branch; only the spatial branch differs. Each name gets its own checkpoint
+# (weights_path() -> models/best_model_<name>.pth).
+HYBRID_SPATIAL_BACKBONE = {
+    "hybrid_clip": "smallcnn",
+    "hybrid_effb0": "efficientnet_b0",
+    "hybrid_effb1": "efficientnet_b1",
+}
+
+
+def is_hybrid(name):
+    """True if `name` selects a HybridDetector variant."""
+    return name in HYBRID_SPATIAL_BACKBONE
 
 # Singleton config instances imported across the project.
 MODEL_CFG = ModelConfig()

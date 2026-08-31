@@ -74,7 +74,7 @@ def main():
     ap.add_argument("input", help="Image file or directory")
     ap.add_argument("--model", type=str, default=MODEL_CFG.name,
                     help="Model variant to build (must match the checkpoint): "
-                         "an EfficientNet name or 'hybrid_clip'.")
+                         "an EfficientNet name, or hybrid_clip / hybrid_effb0 / hybrid_effb1.")
     ap.add_argument("--weights", default=None,
                     help="Checkpoint path. Defaults to the standard path for --model.")
     ap.add_argument("--threshold", type=float, default=0.5)  # decision boundary

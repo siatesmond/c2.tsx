@@ -235,7 +235,7 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Evaluate real-vs-AI detector.")
     ap.add_argument("--model", type=str, default=MODEL_CFG.name,
                     help="Model variant to build (must match the checkpoint): "
-                         "an EfficientNet name or 'hybrid_clip'.")
+                         "an EfficientNet name, or hybrid_clip / hybrid_effb0 / hybrid_effb1.")
     ap.add_argument("--weights", default=None,
                     help="Checkpoint path. Defaults to the standard path for --model.")
     ap.add_argument("--data_root", default=str(DATA_ROOT))

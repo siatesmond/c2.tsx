@@ -404,7 +404,9 @@ def parse_args():
                     help="Disable the interactive continue/stop prompt after each epoch.")
     ap.add_argument("--model", type=str, default=MODEL_CFG.name,
                     help="TorchVision EfficientNet variant (e.g. efficientnet_b0/b1/b2) "
-                         "or 'hybrid_clip'. Each variant is saved to its own checkpoint file.")
+                         "or a hybrid variant: hybrid_clip (small-CNN spatial branch), "
+                         "hybrid_effb0 / hybrid_effb1 (EfficientNet spatial branch). "
+                         "Each variant is saved to its own checkpoint file.")
     ap.add_argument("--data_root", type=str, default=str(DATA_ROOT),
                     help="Dataset root containing {train,val}/{real,ai}. Point at a small "
                          "subset folder for a quick pipeline smoke test.")

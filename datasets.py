@@ -10,7 +10,7 @@ from torchvision import transforms
 
 # Project-local augmentation helpers (random, family-based training augmentation)
 from augmentations import apply_training_augmentation
-from config import HYBRID_CFG, HYBRID_MODEL_NAME
+from config import HYBRID_CFG, is_hybrid
 from frequency import stack_image_and_spectrogram
 
 # Allow PIL to load images that are truncated/incomplete (common with scraped data).
@@ -54,7 +54,7 @@ class HybridTransform:
 
 def build_transform(image_size, train, model_name=None):
     """Pick the right image pipeline for the configured model."""
-    if model_name == HYBRID_MODEL_NAME:
+    if is_hybrid(model_name):
         return HybridTransform(image_size)
     return build_base_transform(image_size, train)
 
